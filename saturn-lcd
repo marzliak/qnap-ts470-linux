@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+import os, time, termios, subprocess
+
+PORT = "/dev/ttyS1"
+PAGE_TIME = 5
+DETAIL_TIMEOUT = 15
+HW_REFRESH = 10
+
+def setup_serial(port):
+    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    attrs = termios.tcgetattr(fd)
+    attrs[0] = 0
+    attrs[1] = 0
+    attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+    attrs[3] = 0
+    attrs[4] = termios.B1200
+    attrs[5] = termios.B1200
+    attrs[6][termios.VMIN] = 0
+    attrs[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    return fd
+
+def lcd_write(fd, line1, line2):
+    l1 = f"{line1:<16.16s}".encode()
+    l2 = f"{line2:<16.16s}".encode()
+    os.write(fd, b'\x4d\x0c\x00\x10' + l1)
+    time.sleep(0.18)
+    os.write(fd, b'\x4d\x0c\x01\x10' + l2)
+    time.sleep(0.18)
+
+def read_button(fd):
+    try:
+        data = os.read(fd, 64)
+        for i in range(len(data) - 3):
+            if data[i] == 0x53 and data[i+1] == 0x05 and data[i+2] == 0x00:
+                return data[i+3]
+    except (BlockingIOError, OSError):
+        pass
+    return None
+
+def sh(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode().strip()
+    except:
+        return ""
+
+def fmt_thousands(val):
+    try:
+        s = str(int(val))
+        result = []
+        for i, c in enumerate(reversed(s)):
+            if i > 0 and i % 3 == 0:
+                result.append('.')
+            result.append(c)
+        return ''.join(reversed(result))
+    except:
+        return val
+
+def fmt_bytes(n):
+    try:
+        n = int(n)
+        if n >= 1_000_000_000:
+            return f"{n/1_000_000_000:.1f}G"
+        elif n >= 1_000_000:
+            return f"{n/1_000_000:.1f}M"
+        elif n >= 1_000:
+            return f"{n/1_000:.0f}K"
+        return f"{n}B"
+    except:
+        return "0"
+
+def read_cpu_ticks():
+    with open("/proc/stat") as f:
+        parts = f.readline().split()
+    # user nice system idle iowait irq softirq
+    vals = [int(x) for x in parts[1:8]]
+    idle = vals[3] + vals[4]  # idle + iowait
+    total = sum(vals)
+    return idle, total
+
+def get_net_bytes():
+    try:
+        iface = sh("ip route | awk '/default/{print $5}' | head -1")
+        if not iface:
+            return 0, 0
+        rx = int(sh(f"cat /sys/class/net/{iface}/statistics/rx_bytes"))
+        tx = int(sh(f"cat /sys/class/net/{iface}/statistics/tx_bytes"))
+        return rx, tx
+    except:
+        return 0, 0
+
+def get_disks():
+    disks = []
+    devs = sorted([f"/dev/{d}" for d in os.listdir("/dev") if d.startswith("sd") and len(d) == 3])
+    for dev in devs:
+        name = sh(f"lsblk -d -n -o NAME {dev}").strip()
+        size = sh(f"lsblk -d -n -o SIZE {dev}").strip()
+        model = sh(f"smartctl -i {dev} | grep 'Device Model' | sed 's/.*: *//'")[:16]
+        temp = sh(f"smartctl -A {dev} | grep -iE 'Temp.*Cel' | awk '{{print $10}}' | head -1")
+        hours = sh(f"smartctl -A {dev} | grep Power_On_Hours | awk '{{print $10}}' | sed 's/h.*//'")
+        realloc = sh(f"smartctl -A {dev} | grep Reallocated_Sector | awk '{{print $10}}'")
+        pending = sh(f"smartctl -A {dev} | grep Current_Pending | awk '{{print $10}}'") or "0"
+        health = "OK" if "PASSED" in sh(f"smartctl -H {dev}") else "FAIL"
+        cycles = sh(f"smartctl -A {dev} | grep Power_Cycle | awk '{{print $10}}'")
+        disks.append(dict(name=name, size=size, model=model, temp=temp,
+                          hours=hours, realloc=realloc, pending=pending,
+                          health=health, cycles=cycles))
+    return disks
+
+def detail_pages(d):
+    warn = f" R:{d['realloc']}!" if d['realloc'] != "0" else ""
+    return [
+        f"{d['name']} {d['size']} {d['temp']}C {d['health']}{warn}",
+        d['model'],
+        f"{d['hours']}h Re:{d['realloc']} P:{d['pending']}",
+        f"Cycles:{d['cycles']}",
+    ]
+
+def main():
+    fd = setup_serial(PORT)
+    os.write(fd, b'\x4d\x5e\x01')
+    time.sleep(0.1)
+
+    disks = get_disks()
+    hostname = sh("hostname").upper()
+    ndisks = len(disks)
+
+    prev_rx, prev_tx = get_net_bytes()
+    prev_net_time = time.time()
+    rx_rate = "0K"
+    tx_rate = "0K"
+
+    prev_idle, prev_total = read_cpu_ticks()
+    cpu_pct = "0"
+
+    last_hw = 0
+    auto_idx = 0
+    mode = "auto"
+    d_disk = 0
+    d_page = 0
+    last_btn = time.time()
+    hw_pages = []
+
+    def refresh_hw():
+        nonlocal hw_pages, prev_rx, prev_tx, prev_net_time, rx_rate, tx_rate
+        nonlocal prev_idle, prev_total, cpu_pct
+
+        ct = sh("awk '{printf \"%.0f\",$1/1000}' /sys/class/hwmon/hwmon2/temp1_input")
+        ld = sh("awk '{print $1}' /proc/loadavg")
+        mem_used = sh("free -m | awk '/Mem:/{print $3}'")
+        mem_total = sh("free -m | awk '/Mem:/{print $2}'")
+        ip = sh("hostname -I | awk '{print $1}'")
+        uh, um = sh("awk '{h=int($1/3600);m=int(($1%3600)/60);print h,m}' /proc/uptime").split()
+        up = f"{uh}h{um}m" if int(uh) > 0 else f"{um}m"
+        dt = time.strftime("%H:%M %d/%b/%Y")
+        board = sh("cat /sys/class/hwmon/hwmon0/temp1_input 2>/dev/null")
+        board = str(int(board)//1000) if board else "?"
+        nic = sh("cat /sys/class/hwmon/hwmon1/temp1_input 2>/dev/null")
+        nic = str(int(nic)//1000) if nic else "?"
+
+        # CPU usage delta
+        cur_idle, cur_total = read_cpu_ticks()
+        d_idle = cur_idle - prev_idle
+        d_total = cur_total - prev_total
+        if d_total > 0:
+            cpu_pct = f"{100 * (d_total - d_idle) / d_total:.0f}"
+        prev_idle, prev_total = cur_idle, cur_total
+
+        # Net rate
+        now = time.time()
+        cur_rx, cur_tx = get_net_bytes()
+        elapsed = now - prev_net_time
+        if elapsed > 0:
+            rx_rate = fmt_bytes(int((cur_rx - prev_rx) / elapsed))
+            tx_rate = fmt_bytes(int((cur_tx - prev_tx) / elapsed))
+        prev_rx, prev_tx = cur_rx, cur_tx
+        prev_net_time = now
+
+        ram = f"{fmt_thousands(mem_used)}/{fmt_thousands(mem_total)}M"
+
+        hw_pages = [
+            (hostname, ip),
+            (f"CPU:{ct}C Load:{ld}", f"RAM {ram}"),
+            (f"Uptime:{up}", f"{ndisks} disks online"),
+            (f"CPU Use: {cpu_pct}%", dt),
+            (f"Board:{board}C NIC:{nic}C", f"Rx:{rx_rate} Tx:{tx_rate}"),
+        ]
+
+    refresh_hw()
+
+    while True:
+        now = time.time()
+        if now - last_hw > HW_REFRESH:
+            refresh_hw()
+            last_hw = now
+
+        btn = read_button(fd)
+        if btn == 0x02:
+            if mode == "auto":
+                mode = "detail"
+                d_disk = 0
+                d_page = 0
+            else:
+                d_disk += 1
+                d_page = 0
+                if d_disk >= len(disks):
+                    mode = "auto"
+                    d_disk = 0
+            last_btn = now
+        elif btn == 0x01:
+            if mode == "detail":
+                d_page = (d_page + 1) % 4
+            else:
+                mode = "detail"
+                d_disk = 0
+                d_page = 0
+            last_btn = now
+
+        if mode == "detail" and now - last_btn > DETAIL_TIMEOUT:
+            mode = "auto"
+
+        if mode == "auto":
+            l1, l2 = hw_pages[auto_idx % len(hw_pages)]
+            lcd_write(fd, l1, l2)
+            auto_idx += 1
+            for _ in range(int(PAGE_TIME / 0.2)):
+                time.sleep(0.2)
+                b = read_button(fd)
+                if b in (0x01, 0x02):
+                    mode = "detail"
+                    d_disk = 0
+                    d_page = 0
+                    last_btn = time.time()
+                    break
+        else:
+            pages = detail_pages(disks[d_disk])
+            lcd_write(fd, f"[{disks[d_disk]['name']}] pg {d_page+1}/4", pages[d_page])
+            time.sleep(0.3)
+
+if __name__ == "__main__":
+    main()
