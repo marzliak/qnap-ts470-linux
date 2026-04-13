@@ -23,7 +23,7 @@ chmod +x /usr/local/bin/saturn-lcd
 chmod +x /usr/local/bin/saturn-fan-calibrate
 
 # Systemd: fan control daemon (calibrates on first run, then controls temperature)
-cat > /etc/systemd/system/saturn-fan.service << 'SVC'
+cat > /etc/systemd/system/saturn-fancontrol.service << 'SVC'
 [Unit]
 Description=Saturn Fan Control (calibration + temperature loop)
 After=multi-user.target
@@ -44,7 +44,7 @@ SVC
 cat > /etc/systemd/system/saturn-lcd.service << 'SVC'
 [Unit]
 Description=Saturn LCD Monitor
-After=multi-user.target saturn-fan.service
+After=multi-user.target saturn-fancontrol.service
 
 [Service]
 Type=simple
@@ -58,26 +58,26 @@ SVC
 
 # Enable and start
 systemctl daemon-reload
-systemctl enable saturn-fan
+systemctl enable saturn-fancontrol
 systemctl enable saturn-lcd
 
 echo ""
 echo "=== Starting services ==="
-systemctl start saturn-fan
+systemctl start saturn-fancontrol
 sleep 2
 systemctl start saturn-lcd
 
 echo ""
 echo "=== Status ==="
-systemctl is-active saturn-fan saturn-lcd
+systemctl is-active saturn-fancontrol saturn-lcd
 
 echo ""
 echo "=== Saturn installed successfully ==="
-echo "Boot order: modprobe -> saturn-fan (calibrate + control loop) -> saturn-lcd"
+echo "Boot order: modprobe -> saturn-fancontrol (calibrate + control loop) -> saturn-lcd"
 echo ""
 echo "Useful commands:"
-echo "  systemctl status saturn-fan       # fan control status"
+echo "  systemctl status saturn-fancontrol       # fan control status"
 echo "  systemctl status saturn-lcd       # LCD status"
-echo "  journalctl -u saturn-fan -f       # fan control logs"
+echo "  journalctl -u saturn-fancontrol -f       # fan control logs"
 echo "  saturn-fan-calibrate --force      # force recalibration"
-echo "  saturn-fan-calibrate --calibrate-only  # calibrate without starting loop"
+echo "  saturn-fan-calibrate --calibrate-only  # calibrate without daemon"

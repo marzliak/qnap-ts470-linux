@@ -37,21 +37,21 @@ Everything is automatic. Zero user interaction required.
 
 | Service | Type | Description |
 |---------|------|-------------|
-| `saturn-fan` | daemon | Fan calibration on first run, then temperature control loop |
+| `saturn-fancontrol` | daemon | Fan calibration on first run, then temperature control loop |
 | `saturn-lcd` | daemon | LCD display with auto-rotate and button navigation |
 
-Dependencies: `saturn-fan` → `saturn-lcd`
+Dependencies: `saturn-fancontrol` → `saturn-lcd`
 
 ```bash
 # Check all services
-systemctl is-active saturn-fan saturn-lcd
+systemctl is-active saturn-fancontrol saturn-lcd
 
 # Manual control
 systemctl stop saturn-lcd
 systemctl start saturn-lcd
 systemctl restart saturn-lcd
 journalctl -u saturn-lcd -f    # view logs
-journalctl -u saturn-fan -f    # view fan control logs
+journalctl -u saturn-fancontrol -f    # view fan control logs
 ```
 
 ---
@@ -183,7 +183,7 @@ Detail pages per disk:
 cat > /etc/systemd/system/saturn-lcd.service << 'SVC'
 [Unit]
 Description=Saturn LCD Monitor
-After=multi-user.target saturn-fan.service
+After=multi-user.target saturn-fancontrol.service
 
 [Service]
 Type=simple
@@ -208,7 +208,7 @@ systemctl start saturn-lcd
 
 The rear chassis fan connects to **Fintek channel 2** (`fan2_input` / `pwm2`). Channels 1 and 3 have no fans connected.
 
-> **Note**: The `fancontrol` system package does not work with this hardware — the f71882fg driver exposes sysfs files directly under the device path, not under `/sys/class/hwmon/hwmonX/`. `saturn-fan` is a self-contained Python daemon that reads the same sysfs files directly, with no system package dependencies beyond Python 3.
+> **Note**: The `fancontrol` system package does not work with this hardware — the f71882fg driver exposes sysfs files directly under the device path, not under `/sys/class/hwmon/hwmonX/`. `saturn-fancontrol` is a self-contained Python daemon that reads the same sysfs files directly, with no system package dependencies beyond Python 3.
 
 Calibrated values (auto-detected per fan):
 
@@ -240,7 +240,7 @@ echo 200 > $P/pwm2
 echo 2 > $P/pwm2_enable
 ```
 
-### Auto-Calibration (`saturn-fan`)
+### Auto-Calibration (`saturn-fancontrol`)
 
 Script: `/usr/local/bin/saturn-fan-calibrate`
 
@@ -276,7 +276,7 @@ saturn-fan-calibrate --calibrate-only
 ### Systemd Service
 
 ```bash
-cat > /etc/systemd/system/saturn-fan.service << 'SVC'
+cat > /etc/systemd/system/saturn-fancontrol.service << 'SVC'
 [Unit]
 Description=Saturn Fan Control (calibration + temperature loop)
 After=multi-user.target
@@ -348,7 +348,7 @@ Files: `fan{1,2,3}_input`, `pwm{1,2,3}`, `pwm{1,2,3}_enable`, `in{0-8}_input`, `
 | `/usr/local/bin/saturn-lcd` | LCD monitor daemon (Python) |
 | `/usr/local/bin/saturn-fan-calibrate` | Fan calibration + control daemon (Python) |
 | `/etc/saturn-fan-cache.json` | Calibration cache |
-| `/etc/systemd/system/saturn-fan.service` | Fan control systemd service |
+| `/etc/systemd/system/saturn-fancontrol.service` | Fan control systemd service |
 | `/etc/systemd/system/saturn-lcd.service` | LCD systemd service |
 | `/etc/modules` | Kernel modules (coretemp, f71882fg) |
 
@@ -358,7 +358,7 @@ Files: `fan{1,2,3}_input`, `pwm{1,2,3}`, `pwm{1,2,3}_enable`, `in{0-8}_input`, `
 
 - The original QNAP fan died and was replaced. The replacement connects to Fintek channel 2.
 - Fan channels 1 and 3 have no fans connected (0 RPM).
-- The `fancontrol` system package does not work on this hardware — use `saturn-fan` instead.
+- The `fancontrol` system package does not work on this hardware — use `saturn-fancontrol` instead.
 - The USB Copy front panel button is not accessible via the A125 serial protocol or Linux input subsystem. It likely requires the IT8528E EC.
 - The A125 LCD backlight has no adjustable brightness — only on/off. Dim appearance is normal for aged units.
 
