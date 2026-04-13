@@ -5,6 +5,9 @@ PORT = "/dev/ttyS1"
 PAGE_TIME = 5
 DETAIL_TIMEOUT = 15
 HW_REFRESH = 10
+SCREEN_TIMEOUT = 600
+TRIPLE_WINDOW = 1.5  # 3 clicks em 1.5s
+FAN_HWMON = "/sys/devices/platform/f71882fg.2592"
 
 def setup_serial(port):
     fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -27,6 +30,10 @@ def lcd_write(fd, line1, line2):
     time.sleep(0.18)
     os.write(fd, b'\x4d\x0c\x01\x10' + l2)
     time.sleep(0.18)
+
+def lcd_backlight(fd, on):
+    os.write(fd, b'\x4d\x5e' + bytes([0x01 if on else 0x00]))
+    time.sleep(0.05)
 
 def read_button(fd):
     try:
@@ -72,11 +79,24 @@ def fmt_bytes(n):
 def read_cpu_ticks():
     with open("/proc/stat") as f:
         parts = f.readline().split()
-    # user nice system idle iowait irq softirq
     vals = [int(x) for x in parts[1:8]]
-    idle = vals[3] + vals[4]  # idle + iowait
+    idle = vals[3] + vals[4]
     total = sum(vals)
     return idle, total
+
+def read_fan(n):
+    try:
+        with open(f"{FAN_HWMON}/fan{n}_input") as f:
+            return int(f.read().strip())
+    except:
+        return 0
+
+def read_pwm(n):
+    try:
+        with open(f"{FAN_HWMON}/pwm{n}") as f:
+            return int(f.read().strip())
+    except:
+        return 0
 
 def get_net_bytes():
     try:
@@ -118,8 +138,7 @@ def detail_pages(d):
 
 def main():
     fd = setup_serial(PORT)
-    os.write(fd, b'\x4d\x5e\x01')
-    time.sleep(0.1)
+    lcd_backlight(fd, True)
 
     disks = get_disks()
     hostname = sh("hostname").upper()
@@ -129,7 +148,6 @@ def main():
     prev_net_time = time.time()
     rx_rate = "0K"
     tx_rate = "0K"
-
     prev_idle, prev_total = read_cpu_ticks()
     cpu_pct = "0"
 
@@ -139,7 +157,12 @@ def main():
     d_disk = 0
     d_page = 0
     last_btn = time.time()
+    last_activity = time.time()
+    screen_on = True
     hw_pages = []
+
+    # Triple-click tracking
+    select_times = []
 
     def refresh_hw():
         nonlocal hw_pages, prev_rx, prev_tx, prev_net_time, rx_rate, tx_rate
@@ -158,7 +181,6 @@ def main():
         nic = sh("cat /sys/class/hwmon/hwmon1/temp1_input 2>/dev/null")
         nic = str(int(nic)//1000) if nic else "?"
 
-        # CPU usage delta
         cur_idle, cur_total = read_cpu_ticks()
         d_idle = cur_idle - prev_idle
         d_total = cur_total - prev_total
@@ -166,7 +188,6 @@ def main():
             cpu_pct = f"{100 * (d_total - d_idle) / d_total:.0f}"
         prev_idle, prev_total = cur_idle, cur_total
 
-        # Net rate
         now = time.time()
         cur_rx, cur_tx = get_net_bytes()
         elapsed = now - prev_net_time
@@ -177,25 +198,66 @@ def main():
         prev_net_time = now
 
         ram = f"{fmt_thousands(mem_used)}/{fmt_thousands(mem_total)}M"
+        fan1_rpm = read_fan(1)
+        fan2_rpm = read_fan(2)
+        fan2_pwm = read_pwm(2)
+        fan2_pct = int(fan2_pwm / 255 * 100)
 
         hw_pages = [
             (hostname, ip),
             (f"CPU:{ct}C Load:{ld}", f"RAM {ram}"),
             (f"Uptime:{up}", f"{ndisks} disks online"),
             (f"CPU Use: {cpu_pct}%", dt),
-            (f"Board:{board}C NIC:{nic}C", f"Rx:{rx_rate} Tx:{tx_rate}"),
+            (f"Fan1: {fan1_rpm} RPM", f"Fan2: {fan2_rpm} RPM {fan2_pct}%"),
+            (f"Net Rx:{rx_rate}", f"Net Tx:{tx_rate}"),
+            (f"CPU:{ct}C Board:{board}C", f"NIC:{nic}C"),
         ]
 
     refresh_hw()
 
-    while True:
-        now = time.time()
-        if now - last_hw > HW_REFRESH:
-            refresh_hw()
-            last_hw = now
+    def process_btn(btn):
+        nonlocal mode, d_disk, d_page, last_btn, last_activity
+        nonlocal screen_on, select_times
 
-        btn = read_button(fd)
-        if btn == 0x02:
+        now = time.time()
+        last_activity = now
+
+        # Wake from sleep
+        if not screen_on:
+            if btn in (0x01, 0x02):
+                screen_on = True
+                lcd_backlight(fd, True)
+                mode = "auto"
+            return
+
+        if btn == 0x02:  # SELECT
+            select_times.append(now)
+            select_times = [t for t in select_times if now - t < TRIPLE_WINDOW]
+
+            if len(select_times) >= 3:
+                # Triple click - turn off screen
+                select_times = []
+                screen_on = False
+                lcd_backlight(fd, False)
+                lcd_write(fd, "", "")
+                mode = "auto"
+                return
+
+        elif btn == 0x01:  # ENTER
+            select_times = []
+            if mode == "detail":
+                d_page = (d_page + 1) % 4
+            else:
+                mode = "detail"
+                d_disk = 0
+                d_page = 0
+            last_btn = now
+
+    def check_pending_select():
+        nonlocal mode, d_disk, d_page, last_btn, select_times
+        now = time.time()
+        if select_times and (now - select_times[-1]) > TRIPLE_WINDOW:
+            select_times = []
             if mode == "auto":
                 mode = "detail"
                 d_disk = 0
@@ -207,14 +269,30 @@ def main():
                     mode = "auto"
                     d_disk = 0
             last_btn = now
-        elif btn == 0x01:
-            if mode == "detail":
-                d_page = (d_page + 1) % 4
-            else:
-                mode = "detail"
-                d_disk = 0
-                d_page = 0
-            last_btn = now
+
+    while True:
+        now = time.time()
+
+        # Screen timeout
+        if screen_on and (now - last_activity) > SCREEN_TIMEOUT:
+            screen_on = False
+            lcd_backlight(fd, False)
+            lcd_write(fd, "", "")
+            mode = "auto"
+
+        if now - last_hw > HW_REFRESH:
+            refresh_hw()
+            last_hw = now
+
+        btn = read_button(fd)
+        if btn is not None and btn != 0x00:
+            process_btn(btn)
+
+        check_pending_select()
+
+        if not screen_on:
+            time.sleep(0.3)
+            continue
 
         if mode == "detail" and now - last_btn > DETAIL_TIMEOUT:
             mode = "auto"
@@ -226,12 +304,11 @@ def main():
             for _ in range(int(PAGE_TIME / 0.2)):
                 time.sleep(0.2)
                 b = read_button(fd)
-                if b in (0x01, 0x02):
-                    mode = "detail"
-                    d_disk = 0
-                    d_page = 0
-                    last_btn = time.time()
-                    break
+                if b is not None and b != 0x00:
+                    process_btn(b)
+                    check_pending_select()
+                    if not screen_on or mode == "detail":
+                        break
         else:
             pages = detail_pages(disks[d_disk])
             lcd_write(fd, f"[{disks[d_disk]['name']}] pg {d_page+1}/4", pages[d_page])
