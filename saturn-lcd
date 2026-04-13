@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-import os, time, termios, subprocess
+"""
+Saturn LCD Monitor
+QNAP TS-470 Pro ICP A125 LCD display with auto-rotate and button navigation.
+Protocol: /dev/ttyS1 @ 1200 baud 8N1, 0x4D command prefix
+"""
+import os, time, termios, subprocess, glob
 
 PORT = "/dev/ttyS1"
 PAGE_TIME = 5
 DETAIL_TIMEOUT = 15
 HW_REFRESH = 10
 SCREEN_TIMEOUT = 600
-TRIPLE_WINDOW = 1.5  # 3 clicks em 1.5s
+TRIPLE_WINDOW = 1.5
 FAN_HWMON = "/sys/devices/platform/f71882fg.2592"
 
 def setup_serial(port):
@@ -84,6 +89,21 @@ def read_cpu_ticks():
     total = sum(vals)
     return idle, total
 
+def find_hwmon(name):
+    """Find hwmon path by chip name (hwmon numbers can change between boots)"""
+    for hwmon_dir in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            with open(os.path.join(hwmon_dir, "name")) as f:
+                if f.read().strip() == name:
+                    return hwmon_dir
+        except:
+            continue
+    return None
+
+HWMON_CORETEMP = find_hwmon("coretemp") or "/sys/class/hwmon/hwmon2"
+HWMON_ACPI = find_hwmon("acpitz") or "/sys/class/hwmon/hwmon0"
+HWMON_NIC = find_hwmon("r8169_0_100:00") or "/sys/class/hwmon/hwmon1"
+
 def read_fan(n):
     try:
         with open(f"{FAN_HWMON}/fan{n}_input") as f:
@@ -160,15 +180,13 @@ def main():
     last_activity = time.time()
     screen_on = True
     hw_pages = []
-
-    # Triple-click tracking
     select_times = []
 
     def refresh_hw():
         nonlocal hw_pages, prev_rx, prev_tx, prev_net_time, rx_rate, tx_rate
         nonlocal prev_idle, prev_total, cpu_pct
 
-        ct = sh("awk '{printf \"%.0f\",$1/1000}' /sys/class/hwmon/hwmon2/temp1_input")
+        ct = sh(f"awk '{{printf \"%.0f\",$1/1000}}' {HWMON_CORETEMP}/temp1_input")
         ld = sh("awk '{print $1}' /proc/loadavg")
         mem_used = sh("free -m | awk '/Mem:/{print $3}'")
         mem_total = sh("free -m | awk '/Mem:/{print $2}'")
@@ -176,9 +194,9 @@ def main():
         uh, um = sh("awk '{h=int($1/3600);m=int(($1%3600)/60);print h,m}' /proc/uptime").split()
         up = f"{uh}h{um}m" if int(uh) > 0 else f"{um}m"
         dt = time.strftime("%H:%M %d/%b/%Y")
-        board = sh("cat /sys/class/hwmon/hwmon0/temp1_input 2>/dev/null")
+        board = sh(f"cat {HWMON_ACPI}/temp1_input 2>/dev/null")
         board = str(int(board)//1000) if board else "?"
-        nic = sh("cat /sys/class/hwmon/hwmon1/temp1_input 2>/dev/null")
+        nic = sh(f"cat {HWMON_NIC}/temp1_input 2>/dev/null")
         nic = str(int(nic)//1000) if nic else "?"
 
         cur_idle, cur_total = read_cpu_ticks()
@@ -222,7 +240,6 @@ def main():
         now = time.time()
         last_activity = now
 
-        # Wake from sleep
         if not screen_on:
             if btn in (0x01, 0x02):
                 screen_on = True
@@ -230,21 +247,18 @@ def main():
                 mode = "auto"
             return
 
-        if btn == 0x02:  # SELECT
+        if btn == 0x02:
             select_times.append(now)
-            select_times = [t for t in select_times if now - t < TRIPLE_WINDOW]
-
+            select_times[:] = [t for t in select_times if now - t < TRIPLE_WINDOW]
             if len(select_times) >= 3:
-                # Triple click - turn off screen
-                select_times = []
+                select_times.clear()
                 screen_on = False
                 lcd_backlight(fd, False)
                 lcd_write(fd, "", "")
                 mode = "auto"
                 return
-
-        elif btn == 0x01:  # ENTER
-            select_times = []
+        elif btn == 0x01:
+            select_times.clear()
             if mode == "detail":
                 d_page = (d_page + 1) % 4
             else:
@@ -257,7 +271,7 @@ def main():
         nonlocal mode, d_disk, d_page, last_btn, select_times
         now = time.time()
         if select_times and (now - select_times[-1]) > TRIPLE_WINDOW:
-            select_times = []
+            select_times.clear()
             if mode == "auto":
                 mode = "detail"
                 d_disk = 0
@@ -273,7 +287,6 @@ def main():
     while True:
         now = time.time()
 
-        # Screen timeout
         if screen_on and (now - last_activity) > SCREEN_TIMEOUT:
             screen_on = False
             lcd_backlight(fd, False)

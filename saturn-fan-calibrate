@@ -6,28 +6,31 @@ Uses direct platform device paths (F71869A doesn't expose pwm via hwmon symlink)
 """
 import time, sys, os, json, signal, glob
 
-FAN_PATH  = "/sys/devices/platform/f71882fg.2592"
+FAN_PATH = "/sys/devices/platform/f71882fg.2592"
 CACHE_FILE = "/etc/saturn-fan-cache.json"
-PID_FILE   = "/run/saturn-fancontrol.pid"
+PID_FILE = "/run/saturn-fancontrol.pid"
 
-TEMP_MIN = 30
-TEMP_MAX = 70
-INTERVAL = 10
-
+# Temperature curve
+TEMP_MIN = 30    # Below this: minimum fan speed
+TEMP_MAX = 70    # Above this: maximum fan speed
+INTERVAL = 10    # Seconds between checks
 
 def find_temp_path():
-    """Find coretemp CPU package temp dynamically (hwmon number varies by boot)."""
-    for path in glob.glob("/sys/class/hwmon/hwmon*"):
+    """Dynamically find coretemp hwmon path (hwmon number can change between boots)"""
+    for hwmon_dir in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name_file = os.path.join(hwmon_dir, "name")
         try:
-            name = open(f"{path}/name").read().strip()
+            with open(name_file) as f:
+                if f.read().strip() == "coretemp":
+                    path = os.path.join(hwmon_dir, "temp1_input")
+                    if os.path.exists(path):
+                        return path
         except:
             continue
-        if name == "coretemp":
-            t = f"{path}/temp1_input"
-            if os.path.exists(t):
-                return t
-    return None
+    # Fallback
+    return "/sys/class/hwmon/hwmon2/temp1_input"
 
+TEMP_PATH = find_temp_path()
 
 def read_sysfs(path):
     try:
@@ -47,8 +50,8 @@ def read_rpm(ch):
     v = read_sysfs(f"{FAN_PATH}/fan{ch}_input")
     return int(v) if v else 0
 
-def read_temp(temp_path):
-    v = read_sysfs(temp_path)
+def read_temp():
+    v = read_sysfs(TEMP_PATH)
     return int(v) // 1000 if v else 50
 
 def set_manual(ch):
@@ -61,8 +64,8 @@ def set_auto(ch):
 def set_pwm(ch, val):
     write_sysfs(f"{FAN_PATH}/pwm{ch}", str(max(0, min(255, val))))
 
-
 def detect_active_channels():
+    """Quick check which channels have fans"""
     active = []
     for ch in [1, 2, 3]:
         rpm = read_rpm(ch)
@@ -77,7 +80,6 @@ def detect_active_channels():
             active.append(ch)
         set_auto(ch)
     return active
-
 
 def load_cache():
     try:
@@ -95,23 +97,30 @@ def needs_calibration():
     if cache is None:
         print("No cached calibration found - calibrating")
         return True
+
     current = detect_active_channels()
     cached_channels = [int(ch) for ch in cache.get("channels", [])]
+
     if sorted(current) != sorted(cached_channels):
         print(f"Fan config changed: was {cached_channels}, now {current} - recalibrating")
         return True
+
     print(f"Fan config unchanged (channels {current}) - using cached calibration")
     return False
-
 
 def calibrate_fan(ch):
     print(f"\n=== Calibrating Fan{ch} ===")
     result = {}
+
     set_manual(ch)
+
+    # Max RPM
     set_pwm(ch, 255)
     time.sleep(4)
     result["max_rpm"] = read_rpm(ch)
     print(f"  Max RPM (PWM 255): {result['max_rpm']}")
+
+    # Find MINSTOP
     print("  Finding minimum PWM before stall...")
     minstop = 255
     for pwm in range(120, 20, -5):
@@ -124,8 +133,11 @@ def calibrate_fan(ch):
         else:
             print(f"    PWM {pwm}: STALLED")
             break
+
     result["minstop"] = min(minstop + 10, 255)
     print(f"  MINSTOP: {result['minstop']} (with +10 margin)")
+
+    # Find MINSTART
     print("  Finding minimum PWM to restart...")
     set_pwm(ch, 0)
     time.sleep(2)
@@ -140,17 +152,21 @@ def calibrate_fan(ch):
             break
         else:
             print(f"    PWM {pwm}: still stalled")
+
     result["minstart"] = min(minstart + 10, 255)
     print(f"  MINSTART: {result['minstart']} (with +10 margin)")
+
+    # RPM at safe minimum
     set_pwm(ch, result["minstop"])
     time.sleep(3)
     result["min_rpm"] = read_rpm(ch)
     print(f"  Min RPM (PWM {result['minstop']}): {result['min_rpm']}")
+
     set_pwm(ch, 160)
     return result
 
-
 def calc_pwm(temp, minpwm, maxpwm):
+    """Linear interpolation between TEMP_MIN and TEMP_MAX"""
     if temp <= TEMP_MIN:
         return minpwm
     if temp >= TEMP_MAX:
@@ -158,17 +174,24 @@ def calc_pwm(temp, minpwm, maxpwm):
     ratio = (temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
     return int(minpwm + ratio * (maxpwm - minpwm))
 
-
-def run_daemon(cache, temp_path):
-    fans     = cache.get("fans", {})
+def run_daemon(cache):
+    """Fan control daemon - manages fan speed based on temperature"""
+    fans = cache.get("fans", {})
     channels = cache.get("channels", [])
+
     if not channels:
         print("No fans to control. Exiting daemon.")
         return
+
+    # Write PID file
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
+
+    # Set all active fans to manual mode
     for ch in channels:
         set_manual(ch)
+
+    # Track if fan is stalled (needs kickstart)
     fan_running = {ch: True for ch in channels}
 
     def cleanup(sig, frame):
@@ -182,73 +205,85 @@ def run_daemon(cache, temp_path):
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, cleanup)
-    signal.signal(signal.SIGINT,  cleanup)
+    signal.signal(signal.SIGINT, cleanup)
 
     print(f"Fan control daemon started (PID {os.getpid()})")
-    print(f"  Channels  : {channels}")
-    print(f"  Temp path : {temp_path}")
+    print(f"  Channels: {channels}")
     print(f"  Temp range: {TEMP_MIN}-{TEMP_MAX}C")
+    print(f"  Interval: {INTERVAL}s")
 
     while True:
-        temp = read_temp(temp_path)
+        temp = read_temp()
+
         for ch in channels:
             fan_data = fans.get(str(ch), {})
-            minpwm   = fan_data.get("minstop",  75)
+            minpwm = fan_data.get("minstop", 75)
             minstart = fan_data.get("minstart", 80)
-            target   = calc_pwm(temp, minpwm, 255)
-            rpm      = read_rpm(ch)
-            if rpm == 0 and target > 0:
+            maxpwm = 255
+
+            target_pwm = calc_pwm(temp, minpwm, maxpwm)
+
+            # Check if fan is running
+            rpm = read_rpm(ch)
+            if rpm == 0 and target_pwm > 0:
+                # Fan stalled, needs kickstart
                 if fan_running.get(ch, False):
-                    print(f"  Fan{ch} stalled at {temp}C, kickstarting")
-                set_pwm(ch, max(target, minstart))
+                    print(f"  Fan{ch} stalled at temp {temp}C, kickstarting (PWM {minstart})")
+                set_pwm(ch, max(target_pwm, minstart))
                 fan_running[ch] = False
             else:
                 if not fan_running.get(ch, True) and rpm > 0:
                     print(f"  Fan{ch} restarted ({rpm} RPM)")
                 fan_running[ch] = rpm > 0
-                set_pwm(ch, target)
+                set_pwm(ch, target_pwm)
+
         time.sleep(INTERVAL)
 
+def calibrate():
+    """Run calibration and return cache data"""
+    active = detect_active_channels()
+    if not active:
+        print("\nNo fans detected.")
+        return None
+
+    fans_data = {}
+    for ch in active:
+        fans_data[ch] = calibrate_fan(ch)
+
+    print("\n" + "=" * 40)
+    print("RESULTS:")
+    for ch, data in fans_data.items():
+        print(f"  Fan{ch}: {data['min_rpm']}-{data['max_rpm']} RPM, "
+              f"PWM {data['minstop']}-255, "
+              f"kickstart at {data['minstart']}")
+
+    cache = {"channels": active, "fans": {str(ch): data for ch, data in fans_data.items()}}
+    save_cache(cache)
+    print(f"Cached to {CACHE_FILE}")
+
+    for ch in active:
+        set_auto(ch)
+    print("Fans restored to auto mode")
+    return cache
 
 def main():
-    force  = "--force"  in sys.argv
+    force = "--force" in sys.argv
     daemon = "--daemon" in sys.argv
 
     print("Saturn Fan Auto-Calibration")
     print("=" * 40)
 
-    temp_path = find_temp_path()
-    if not temp_path:
-        print("ERROR: coretemp not found. Is coretemp module loaded?")
-        sys.exit(1)
-    print(f"Temp sensor: {temp_path}")
-
     if force or needs_calibration():
-        active = detect_active_channels()
-        if not active:
-            print("\nNo fans detected.")
+        cache = calibrate()
+        if cache is None:
             sys.exit(1)
-        fans_data = {}
-        for ch in active:
-            fans_data[ch] = calibrate_fan(ch)
-        print("\n" + "=" * 40)
-        print("RESULTS:")
-        for ch, data in fans_data.items():
-            print(f"  Fan{ch}: {data['min_rpm']}-{data['max_rpm']} RPM, "
-                  f"PWM {data['minstop']}-255, kickstart at {data['minstart']}")
-        cache = {"channels": active, "fans": {str(ch): data for ch, data in fans_data.items()}}
-        save_cache(cache)
-        print(f"Cached to {CACHE_FILE}")
-        for ch in active:
-            set_auto(ch)
     else:
         cache = load_cache()
-        print("Skipping calibration")
+        print("Skipping calibration (use --force to override)")
 
     if daemon:
         print("\n=== Starting fan control daemon ===")
-        run_daemon(cache, temp_path)
-
+        run_daemon(cache)
 
 if __name__ == "__main__":
     main()
