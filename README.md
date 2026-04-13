@@ -21,6 +21,52 @@ Tested on TS-470 Pro. Likely compatible with: TS-470, TS-670, TS-670 Pro, TS-870
 | Sensors | coretemp (CPU), acpitz (board), r8169 (NIC), Fintek (voltages/thermistors) |
 | Fan | Rear chassis fan on Fintek channel 2 (fan2/pwm2) |
 
+---
+
+## Boot Sequence
+
+Everything is automatic. Zero user interaction required.
+
+```
+1. Kernel loads f71882fg + coretemp modules
+2. saturn-fan  →  calibrates fans (or loads cache), then runs temperature control loop
+3. saturn-lcd  →  starts LCD display monitor
+```
+
+### Systemd Services
+
+| Service | Type | Description |
+|---------|------|-------------|
+| `saturn-fan` | daemon | Fan calibration on first run, then temperature control loop |
+| `saturn-lcd` | daemon | LCD display with auto-rotate and button navigation |
+
+Dependencies: `saturn-fan` → `saturn-lcd`
+
+```bash
+# Check all services
+systemctl is-active saturn-fan saturn-lcd
+
+# Manual control
+systemctl stop saturn-lcd
+systemctl start saturn-lcd
+systemctl restart saturn-lcd
+journalctl -u saturn-lcd -f    # view logs
+journalctl -u saturn-fan -f    # view fan control logs
+```
+
+---
+
+## Install
+
+```bash
+apt install -y lm-sensors smartmontools
+bash install.sh
+```
+
+Installs both services, enables them at boot, and runs the first calibration automatically.
+
+---
+
 ## LCD Protocol (ICP A125)
 
 ### Serial Configuration
@@ -41,7 +87,7 @@ All commands start with `0x4D` prefix.
 | Backlight OFF | `4D 5E 00` | Turn LCD backlight off |
 | Write Line 1 | `4D 0C 00 10` + 16 chars | Write to first line |
 | Write Line 2 | `4D 0C 01 10` + 16 chars | Write to second line |
-| Write Both | `4D 0C 00 20` + 32 chars | Write both lines at once (first write only) |
+| Write Both | `4D 0C 00 20` + 32 chars | Write both lines (first write only) |
 | Clear Display | `4D 28` | Clear screen content |
 | Stop Auto-Clock | `4D 0D` | Stop built-in clock display |
 
@@ -82,132 +128,19 @@ At 1200 baud (8N1 = 10 bits/byte):
 - **Minimum delay between writes**: 180ms
 - **Minimum page interval**: ~500ms (practical: 3-5 seconds)
 
-Scroll (character-by-character) is not viable at 1200 baud — use page-based rotation instead.
+Character-by-character scrolling is not viable at 1200 baud — use page-based rotation instead.
 
 ### Brightness
 
 The A125 board has **no brightness/contrast control** — only backlight on/off. Tested commands `0x5F`, `0x5D`, `0x5C`, `0x5B` with various values — none affected brightness. Dim backlight is due to LED/CCFL aging.
 
-## Hardware Sensors
-
-### Kernel Modules
-
-```bash
-modprobe coretemp
-modprobe f71882fg
-```
-
-Add to `/etc/modules` for boot persistence:
-```
-coretemp
-f71882fg
-```
-
-### Available Sensors
-
-| Sensor | Hwmon Path | Values |
-|--------|-----------|--------|
-| CPU Package + 4 cores | `/sys/class/hwmon/hwmon2/temp1_input` | millidegrees C |
-| Board (ACPI) temp1 | `/sys/class/hwmon/hwmon0/temp1_input` | millidegrees C |
-| Board (ACPI) temp2 | `/sys/class/hwmon/hwmon0/temp2_input` | millidegrees C |
-| NIC (r8169) | `/sys/class/hwmon/hwmon1/temp1_input` | millidegrees C |
-| Fintek voltages | via `sensors` command | 3.3V, 3VSB, Vbat, etc. |
-| Fintek thermistors | via `sensors` command | 3 zones |
-
-### Fintek F71869A
-
-Detected at ISA 0xa20 with 3 fan channels and 3 PWM outputs. Runtime sysfs at:
-
-```
-/sys/devices/platform/f71882fg.2592/
-```
-
-Files: `fan{1,2,3}_input`, `pwm{1,2,3}`, `pwm{1,2,3}_enable`, `in{0-8}_input`, `temp{1-3}_input`
-
-## Fan Control
-
-### Working Configuration
-
-The rear chassis fan is on **Fintek channel 2** (`fan2_input` / `pwm2`). Confirmed working with full PWM control:
-
-| PWM Value | RPM |
-|-----------|-----|
-| 255 (max) | ~1429 |
-| 162 (auto) | ~940 |
-| 128 | ~792 |
-| 64 | ~377 |
-| 30 (min) | 0 (stalls) |
-
-**Important**: Fan stalls below PWM ~60 and requires PWM 80+ to restart from standstill. The `fancontrol` config accounts for this with `MINSTART=80` and `MINSTOP=60`.
-
-Channels 1 and 3 read 0 RPM (no fans connected).
-
-### Manual Control
-
-```bash
-P=/sys/devices/platform/f71882fg.2592
-
-# Read current state
-cat $P/fan2_input    # RPM
-cat $P/pwm2         # duty cycle (0-255)
-cat $P/pwm2_enable  # 1=manual, 2=auto
-
-# Set manual mode and speed
-echo 1 > $P/pwm2_enable
-echo 200 > $P/pwm2
-
-# Restore automatic
-echo 2 > $P/pwm2_enable
-```
-
-### Automatic Fan Control (fancontrol)
-
-Configuration at `/etc/fancontrol`:
-
-```
-INTERVAL=10
-DEVPATH=hwmon3=devices/platform/f71882fg.2592
-DEVNAME=hwmon3=f71869a
-FCTEMPS=hwmon3/pwm2=hwmon2/temp1_input
-FCFANS=hwmon3/pwm2=hwmon3/fan2_input
-MINTEMP=hwmon3/pwm2=30
-MAXTEMP=hwmon3/pwm2=70
-MINSTART=hwmon3/pwm2=80
-MINSTOP=hwmon3/pwm2=60
-MINPWM=hwmon3/pwm2=60
-MAXPWM=hwmon3/pwm2=255
-```
-
-- Temperature range: 30-70C (CPU package)
-- PWM range: 60-255 (never below 60 to prevent stall)
-- Kick-start at PWM 80 when fan needs to spin up
-- Check interval: 10 seconds
-
-```bash
-systemctl enable fancontrol
-systemctl start fancontrol
-```
+---
 
 ## Saturn LCD Service
 
-### Install
+Script: `/usr/local/bin/saturn-lcd`
 
-The LCD monitor script lives at `/usr/local/bin/saturn-lcd`.
-
-```bash
-cp saturn-lcd /usr/local/bin/saturn-lcd
-chmod +x /usr/local/bin/saturn-lcd
-cp saturn-lcd.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable saturn-lcd
-systemctl start saturn-lcd
-```
-
-Requires Python 3 and `smartmontools` (`apt install smartmontools`).
-
-### Features
-
-**Auto-rotate mode** (7 screens, 5 seconds each):
+### Auto-Rotate Mode (7 screens, 5 seconds each)
 
 | Screen | Line 1 | Line 2 |
 |--------|--------|--------|
@@ -219,9 +152,9 @@ Requires Python 3 and `smartmontools` (`apt install smartmontools`).
 | 6 | Net Rx rate | Net Tx rate |
 | 7 | CPU + Board temp | NIC temp |
 
-Hardware info refreshes every 10 seconds. CPU usage is calculated as delta between readings (real-time, not since boot).
+Hardware info refreshes every 10 seconds. CPU usage is calculated as delta between `/proc/stat` readings (real-time, not since boot).
 
-**Detail mode** (via buttons):
+### Detail Mode (via buttons)
 
 - **SELECT**: Enter detail mode, cycle through disks, return to auto after last disk
 - **ENTER**: Cycle detail pages for current disk
@@ -231,16 +164,18 @@ Detail pages per disk:
 
 | Page | Content |
 |------|---------|
-| 1 | `sdX SIZE TEMPdegC HEALTH` (+ realloc warning if > 0) |
+| 1 | `sdX SIZE TEMPdegC HEALTH` (+ `R:N!` warning if reallocated > 0) |
 | 2 | Device model |
 | 3 | Power-on hours, reallocated sectors, pending sectors |
 | 4 | Power cycle count |
 
-**Screen power management:**
+### Screen Power Management
 
-- **Triple-click SELECT** (3 presses within 1.5s): Toggle LCD backlight on/off
-- **10 minutes inactivity**: LCD turns off automatically
-- **Any button press**: Wakes LCD from sleep (wake only, no action executed)
+| Action | Behavior |
+|--------|----------|
+| Triple-click SELECT (3 presses in 1.5s) | Toggle LCD backlight on/off |
+| 10 minutes inactivity | LCD turns off automatically |
+| Any button press while off | Wakes LCD (wake only, no action executed) |
 
 ### Systemd Service
 
@@ -248,7 +183,7 @@ Detail pages per disk:
 cat > /etc/systemd/system/saturn-lcd.service << 'SVC'
 [Unit]
 Description=Saturn LCD Monitor
-After=multi-user.target
+After=multi-user.target saturn-fan.service
 
 [Service]
 Type=simple
@@ -265,21 +200,169 @@ systemctl enable saturn-lcd
 systemctl start saturn-lcd
 ```
 
+---
+
+## Fan Control
+
+### Hardware
+
+The rear chassis fan connects to **Fintek channel 2** (`fan2_input` / `pwm2`). Channels 1 and 3 have no fans connected.
+
+> **Note**: The `fancontrol` system package does not work with this hardware — the f71882fg driver exposes sysfs files directly under the device path, not under `/sys/class/hwmon/hwmonX/`. `saturn-fan` is a self-contained Python daemon that reads the same sysfs files directly, with no system package dependencies beyond Python 3.
+
+Calibrated values (auto-detected per fan):
+
+| PWM Value | RPM | Note |
+|-----------|-----|------|
+| 255 (max) | ~1564 | Full speed |
+| 160 | ~940 | Normal operation |
+| 75 | ~432 | Minimum safe speed |
+| 65 | ~376 | Restart threshold |
+| 60 | 0 | Stall point |
+
+**Important**: Fan stalls below PWM ~60 and requires PWM 65+ to restart from standstill.
+
 ### Manual Control
 
 ```bash
-systemctl stop saturn-lcd              # stop
-systemctl start saturn-lcd             # start
-systemctl restart saturn-lcd           # restart after editing script
-journalctl -u saturn-lcd -f            # view logs
+P=/sys/devices/platform/f71882fg.2592
+
+# Read current state
+cat $P/fan2_input      # RPM
+cat $P/pwm2            # duty cycle (0-255)
+cat $P/pwm2_enable     # 1=manual, 2=auto
+
+# Set manual mode and speed
+echo 1 > $P/pwm2_enable
+echo 200 > $P/pwm2
+
+# Restore automatic (hand back to saturn-fan)
+echo 2 > $P/pwm2_enable
 ```
+
+### Auto-Calibration (`saturn-fan`)
+
+Script: `/usr/local/bin/saturn-fan-calibrate`
+
+On first boot (or when fans change), the script:
+
+1. **Checks cache** (`/etc/saturn-fan-cache.json`) — if fan config hasn't changed, skips calibration (~5 seconds)
+2. **Detects active fans** — spins up each channel to find connected fans
+3. **Calibrates each fan** — finds max RPM, stall point (MINSTOP), restart threshold (MINSTART)
+4. **Runs temperature control loop** — linear curve 30–70°C → MINPWM–255
+
+Recalibration triggers automatically when:
+- No cache file exists (first run)
+- Fan channels changed (fan added/removed/moved)
+
+Force recalibration:
+```bash
+saturn-fan-calibrate --force
+```
+
+Calibrate only (no control loop):
+```bash
+saturn-fan-calibrate --calibrate-only
+```
+
+### Temperature Curve
+
+| CPU Temp | PWM | Behavior |
+|----------|-----|----------|
+| ≤ 30°C | MINPWM (calibrated) | Minimum speed |
+| 30–70°C | Linear interpolation | Proportional to temp |
+| ≥ 70°C | 255 | Full speed |
+
+### Systemd Service
+
+```bash
+cat > /etc/systemd/system/saturn-fan.service << 'SVC'
+[Unit]
+Description=Saturn Fan Control (calibration + temperature loop)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe f71882fg
+ExecStartPre=/sbin/modprobe coretemp
+ExecStart=/usr/local/bin/saturn-fan-calibrate
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+systemctl daemon-reload
+systemctl enable saturn-fan
+systemctl start saturn-fan
+```
+
+---
+
+## Hardware Sensors
+
+### Kernel Modules
+
+```bash
+modprobe coretemp
+modprobe f71882fg
+```
+
+Loaded automatically at boot via `/etc/modules`:
+```
+coretemp
+f71882fg
+```
+
+### Available Sensors
+
+| Sensor | Path | Values |
+|--------|------|--------|
+| CPU Package + 4 cores | `/sys/class/hwmon/hwmon*/temp1_input` (coretemp) | millidegrees C |
+| Board (ACPI) temp1/2 | `/sys/class/hwmon/hwmon*/temp*_input` (acpitz) | millidegrees C |
+| NIC (r8169) | `/sys/class/hwmon/hwmon*/temp1_input` (r8169) | millidegrees C |
+| Fan2 RPM | `/sys/devices/platform/f71882fg.2592/fan2_input` | RPM |
+| Fan2 PWM | `/sys/devices/platform/f71882fg.2592/pwm2` | 0–255 |
+| Fintek voltages | via `sensors` command | 3.3V, 3VSB, Vbat, etc. |
+| Fintek thermistors | via `sensors` command | 3 zones |
+
+### Fintek F71869A
+
+Detected at ISA 0xa20. Runtime sysfs at:
+
+```
+/sys/devices/platform/f71882fg.2592/
+```
+
+Files: `fan{1,2,3}_input`, `pwm{1,2,3}`, `pwm{1,2,3}_enable`, `in{0-8}_input`, `temp{1-3}_input`
+
+> Note: hwmon numbering (`hwmon0`, `hwmon1`, ...) is not stable across boots and varies by kernel version. Always reference sensors by driver name, not hwmon number.
+
+---
+
+## Files
+
+| Path | Description |
+|------|-------------|
+| `/usr/local/bin/saturn-lcd` | LCD monitor daemon (Python) |
+| `/usr/local/bin/saturn-fan-calibrate` | Fan calibration + control daemon (Python) |
+| `/etc/saturn-fan-cache.json` | Calibration cache |
+| `/etc/systemd/system/saturn-fan.service` | Fan control systemd service |
+| `/etc/systemd/system/saturn-lcd.service` | LCD systemd service |
+| `/etc/modules` | Kernel modules (coretemp, f71882fg) |
+
+---
 
 ## Notes
 
-- The original QNAP fan died and was replaced. The replacement fan connects to Fintek channel 2.
+- The original QNAP fan died and was replaced. The replacement connects to Fintek channel 2.
 - Fan channels 1 and 3 have no fans connected (0 RPM).
+- The `fancontrol` system package does not work on this hardware — use `saturn-fan` instead.
 - The USB Copy front panel button is not accessible via the A125 serial protocol or Linux input subsystem. It likely requires the IT8528E EC.
 - The A125 LCD backlight has no adjustable brightness — only on/off. Dim appearance is normal for aged units.
+
+---
 
 ## Compatible Models
 
@@ -291,6 +374,8 @@ The LCD protocol and sensor layout likely applies to other MAHOBAY-based QNAP mo
 - TS-470U-RP
 
 If you have one of these and want to contribute findings, PRs are welcome.
+
+---
 
 ## References
 
