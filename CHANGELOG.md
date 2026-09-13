@@ -11,6 +11,11 @@ A breaking release. Everything is renamed, fan control changes behaviour, and
 the LCD is now the supported default path. Existing installations are migrated
 automatically — see [docs/MIGRATION_FROM_SATURN.md](docs/MIGRATION_FROM_SATURN.md).
 
+> **Not yet run on hardware.** Both binaries are rewrites, validated offline by
+> tests and against simulated devices. The hardware behaviour they rely on was
+> observed on the reference TS-470 Pro under 1.x, but 2.0.0 itself has not been
+> executed on a TS-x70.
+
 ### Changed - breaking
 
 - Renamed every binary, unit, cache and visible string from the legacy

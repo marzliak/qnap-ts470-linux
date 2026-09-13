@@ -3,11 +3,17 @@
 This project is validated on **one** machine. Everything else on this page is
 an evidence-based estimate, and estimates are labelled as such.
 
+> **Version 2.0.0 has not been executed on any TS-x70.** The rows below record
+> what the *hardware* was observed to do, under the implementation that this
+> release replaces. The current code has been validated offline only. A report
+> confirming 2.0.0 itself on a TS-470 Pro is the single most useful thing
+> anyone could contribute right now.
+
 ## How to read the status column
 
 | Status | Meaning |
 |---|---|
-| **Tested** | Exercised on the reference machine by the maintainer, with the distribution and kernel recorded below. |
+| **Tested** | The capability was exercised on the reference machine, with the distribution and kernel recorded below. This describes the hardware, not the 2.0.0 code — see the note above. |
 | **Unverified** | No test report exists. The estimate is based on published specifications and on how the hardware is built, not on someone running it. |
 | **Unlikely** | Published evidence actively points away from the feature being present. |
 
@@ -146,7 +152,7 @@ unit could expose a different but driver-compatible variant.
 | Distribution | Status |
 |---|---|
 | Ubuntu 24.04 LTS | Tested |
-| Other systemd-based distributions | Unverified - the requirements are Python 3.8+, systemd, and optionally `smartmontools` and `util-linux` |
+| Other systemd-based distributions | Unverified - the requirements are Python 3.9+, systemd, and optionally `smartmontools` and `util-linux` |
 | Non-systemd init | Unverified - the binaries do not depend on systemd, but the units and installer do |
 | QTS (QNAP's own firmware) | Out of scope |
 

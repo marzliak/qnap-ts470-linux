@@ -137,7 +137,7 @@ sudo ./scripts/install.sh --dry-run
 |---|---|
 | A QNAP TS-x70 with the front LCD | Tested: TS-470 Pro. Others unverified. |
 | Linux with systemd | Tested: Ubuntu 24.04 LTS |
-| Python 3.8 or newer | Standard library only, no pip packages |
+| Python 3.9 or newer | Standard library only, no pip packages |
 | `root` / `sudo` | Needed for the serial port and for SMART |
 | `smartmontools` | Optional — disk pages show `N/A` without it |
 | `util-linux` (`lsblk`) | Optional — no disks are listed without it |
