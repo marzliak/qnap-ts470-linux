@@ -166,7 +166,6 @@ preflight() {
 
     if [ "$WITH_FAN" -eq 1 ]; then
         local matches
-        # shellcheck disable=SC2012  # counting entries, names are not parsed
         matches="$(compgen -G '/sys/devices/platform/f71882fg.*' | wc -l || true)"
         if [ "${matches:-0}" -eq 1 ]; then
             ok "fan controller found"
@@ -319,7 +318,11 @@ rollback() {
 }
 
 on_error() {
-    local code=$?
+    # Accept an explicit status: when this is reached through `if ! validate`,
+    # $? is already 0 because the negation succeeded, and exiting 0 would
+    # report a rolled-back install as a success.
+    local code=${1:-$?}
+    [ "$code" -ne 0 ] || code=1
     printf '\n%serror%s installation failed (exit %d)\n' "$RED" "$RESET" "$code" >&2
     rollback
     exit "$code"
@@ -415,12 +418,12 @@ main() {
         migrate_cache
     fi
 
-    trap on_error ERR
+    trap 'on_error $?' ERR
     ROLLBACK_NEEDED=$legacy
     install_files
     enable_services
     if ! validate; then
-        on_error
+        on_error 1
     fi
     ROLLBACK_NEEDED=0
     trap - ERR
