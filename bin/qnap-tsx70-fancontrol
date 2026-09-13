@@ -1,0 +1,1038 @@
+#!/usr/bin/env python3
+"""qnap-tsx70-fancontrol - EXPERIMENTAL chassis fan control for QNAP TS-x70 boards.
+
+Reads the Super-I/O monitoring chip exposed by the f71882fg driver directly,
+because that driver publishes its pwm* files under the platform device rather
+than under /sys/class/hwmon/hwmonN.
+
+Four explicit subcommands; no flag has an implied side effect:
+
+    status      report discovered hardware and cached calibration (read-only)
+    calibrate   HAZARDOUS - deliberately stalls a fan to find its limits
+    run         continuous temperature-driven control loop
+    safe-state  force every channel back to the chip's automatic mode
+
+Safety model (docs/FAN_CONTROL.md has the full discussion):
+
+  * the controller is resolved by driver identity and refuses to guess when
+    more than one device matches;
+  * channels are discovered, never assumed - the reference unit drives only
+    channel 3;
+  * a lock file prevents an interactive calibration and the service loop from
+    fighting over the same registers;
+  * SIGTERM, SIGINT, SIGHUP and SIGQUIT are all handled before the first
+    register write, so an SSH disconnect mid-calibration still fails safe;
+  * every exit path - clean, signalled or crashed - forces full duty and hands
+    the channels back to automatic mode, then reads the registers back to
+    confirm it actually happened;
+  * calibration refuses to start on a hot machine, aborts if temperature rises
+    during the sweep, and caps how long a fan may sit stopped;
+  * a duty floor stops a corrupt or hand-edited calibration from pinning a fan
+    off with no way to restart it;
+  * losing the temperature input escalates to full speed and then exits
+    nonzero, so systemd sees the failure instead of a silent stall.
+"""
+
+import argparse
+import errno
+import fcntl
+import glob
+import json
+import os
+import re
+import signal
+import sys
+import tempfile
+import time
+
+VERSION = "2.0.0"
+
+STATE_DIR = "/var/lib/qnap-tsx70"
+CACHE_FILE = os.path.join(STATE_DIR, "fan-calibration.json")
+LOCK_FILE = os.path.join(STATE_DIR, "fancontrol.lock")
+DEFAULT_DEVICE_GLOB = "/sys/devices/platform/f71882fg.*"
+
+PWM_MIN = 0
+PWM_MAX = 255
+PWM_MANUAL = 1          # pwmN_enable: manual duty cycle
+PWM_AUTOMATIC = 2       # pwmN_enable: chip-internal automatic control
+
+# Lowest duty this program will ever command while a fan is meant to be
+# spinning. Calibration can measure a lower stall point, but a fan parked just
+# above its own stall threshold has no margin for dust, wear or a warm day, and
+# a cache claiming a very low floor must not be able to pin the fan off.
+PWM_FLOOR = 64
+
+TEMP_MIN = 30           # at or below this: minimum calibrated duty
+TEMP_MAX = 70           # at or above this: full speed
+INTERVAL = 10           # seconds between control iterations
+TEMP_FAILURE_LIMIT = 3  # consecutive bad temperature reads before failing safe
+WRITE_FAILURE_LIMIT = 3 # consecutive failed register writes before failing safe
+KICKSTART_LIMIT = 6     # consecutive failed kickstarts before giving up
+
+# Lowest duty the descending sweep will command. Deliberately below PWM_FLOOR:
+# the point of the sweep is to find where this particular fan stops, which may
+# be below the duty the control loop is willing to use afterwards.
+CALIBRATION_SWEEP_MIN = 55
+
+# Calibration guards.
+CALIBRATION_START_MAX_TEMP = 60  # refuse to begin above this
+CALIBRATION_ABORT_TEMP = 70      # abort mid-sweep at or above this
+CALIBRATION_MAX_STALL_S = 45     # longest a fan may sit at 0 RPM
+
+SAFE_PWM = PWM_MAX      # duty applied whenever the safe state is forced
+
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)
+
+
+class FanError(RuntimeError):
+    """Unrecoverable condition; the caller must fail safe and exit nonzero."""
+
+
+class Terminated(BaseException):
+    """Raised from a signal handler so `finally` blocks still run.
+
+    Deliberately derived from BaseException, not Exception: a stray
+    `except Exception` must not be able to swallow a stop request.
+    """
+
+
+# --------------------------------------------------------------------------
+# Pure logic - no I/O, directly unit tested.
+# --------------------------------------------------------------------------
+
+def clamp_pwm(value):
+    try:
+        return max(PWM_MIN, min(PWM_MAX, int(value)))
+    except (TypeError, ValueError):
+        return SAFE_PWM
+
+
+def calc_pwm(temp, min_pwm, max_pwm, temp_min=TEMP_MIN, temp_max=TEMP_MAX):
+    """Linear duty curve between temp_min and temp_max, clamped at both ends."""
+    min_pwm = clamp_pwm(min_pwm)
+    max_pwm = clamp_pwm(max_pwm)
+    if max_pwm < min_pwm:
+        min_pwm, max_pwm = max_pwm, min_pwm
+    if temp_max <= temp_min:
+        return max_pwm
+    if temp <= temp_min:
+        return min_pwm
+    if temp >= temp_max:
+        return max_pwm
+    ratio = (temp - temp_min) / float(temp_max - temp_min)
+    return int(round(min_pwm + ratio * (max_pwm - min_pwm)))
+
+
+def natural_key(path):
+    """Sort hwmon2 before hwmon10.
+
+    Plain lexicographic ordering puts hwmon10 first, which makes "the first
+    matching sensor" depend on how many sensors the machine happens to have.
+    """
+    return [int(part) if part.isdigit() else part
+            for part in re.split(r"(\d+)", path)]
+
+
+def validate_cache(data):
+    """Return a normalised calibration dict, or raise FanError.
+
+    Anything that reaches a PWM register passes through here, so a corrupt,
+    truncated or hand-edited cache cannot drive a fan below PWM_FLOOR.
+    """
+    if not isinstance(data, dict):
+        raise FanError("calibration cache is not a JSON object")
+    raw_channels = data.get("channels")
+    if not isinstance(raw_channels, list) or not raw_channels:
+        raise FanError("calibration cache has no channels")
+    channels = []
+    for item in raw_channels:
+        try:
+            channels.append(int(item))
+        except (TypeError, ValueError):
+            raise FanError("calibration cache has a non-numeric channel: %r"
+                           % (item,))
+    fans = {}
+    raw_fans = data.get("fans") if isinstance(data.get("fans"), dict) else {}
+    for channel in channels:
+        entry = raw_fans.get(str(channel)) or raw_fans.get(channel) or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        minstop = max(PWM_FLOOR, clamp_pwm(entry.get("minstop", SAFE_PWM)))
+        minstart = max(PWM_FLOOR, clamp_pwm(entry.get("minstart", SAFE_PWM)))
+        fans[channel] = {
+            "minstop": minstop,
+            # The restart threshold is measured while ramping up and is the
+            # authoritative "will it spin from standstill" value, so it can
+            # never sit below the descending stall measurement.
+            "minstart": max(minstart, minstop),
+            "min_rpm": entry.get("min_rpm"),
+            "max_rpm": entry.get("max_rpm"),
+        }
+    return {"channels": sorted(set(channels)), "fans": fans,
+            "version": data.get("version", 1)}
+
+
+def calibration_is_degenerate(result):
+    """True when a calibration sweep produced values that must not be trusted.
+
+    The usual cause is a fan that was already stopped, or a tachometer that
+    never reported motion: the sweep then "finds" a stall point at the very
+    first step and the numbers describe nothing real.
+    """
+    if not result:
+        return True
+    if not result.get("max_rpm"):
+        return True
+    if result.get("stall_duty") is None:
+        return True
+    if clamp_pwm(result.get("minstop")) >= PWM_MAX:
+        return True
+    if not result.get("min_rpm"):
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# sysfs access
+# --------------------------------------------------------------------------
+
+def read_sysfs(path):
+    # Narrow except on purpose: a bare except here would swallow Terminated.
+    try:
+        with open(path, encoding="ascii", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def read_int(path):
+    value = read_sysfs(path)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def write_sysfs(path, value):
+    """Write a sysfs attribute. Returns True on success, False otherwise."""
+    try:
+        with open(path, "w", encoding="ascii") as fh:
+            fh.write(str(value))
+        return True
+    except OSError as exc:
+        log("WARN cannot write %s=%s: %s" % (path, value, exc.strerror or exc))
+        return False
+
+
+def log(message):
+    """Unbuffered stdout so journald shows messages as they happen.
+
+    Python block-buffers stdout when it is a pipe, which is exactly the case
+    under systemd - without the flush the journal stays empty during the run
+    that matters.
+    """
+    print(message, flush=True)
+
+
+def find_device(pattern=DEFAULT_DEVICE_GLOB):
+    """Resolve the Super-I/O platform device.
+
+    Zero matches means the driver is not loaded. More than one means the host
+    exposes several instances and picking one would be a guess, so both are
+    refused rather than resolved arbitrarily.
+    """
+    matches = sorted((p for p in glob.glob(pattern) if os.path.isdir(p)),
+                     key=natural_key)
+    if not matches:
+        raise FanError(
+            "no fan controller matched %s - is the f71882fg module loaded? "
+            "(modprobe f71882fg)" % pattern)
+    if len(matches) > 1:
+        raise FanError(
+            "ambiguous fan controller: %d devices match %s (%s); refusing to "
+            "guess. Pass --device-glob to name one." % (len(matches), pattern,
+                                                        ", ".join(matches)))
+    return matches[0]
+
+
+def find_temp_input(sensor="coretemp"):
+    """Locate the CPU package temperature input by driver name, not by index."""
+    for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*"), key=natural_key):
+        if read_sysfs(os.path.join(hwmon, "name")) != sensor:
+            continue
+        candidates = [os.path.join(hwmon, "temp1_input")]
+        candidates += sorted(glob.glob(os.path.join(hwmon, "temp*_input")),
+                             key=natural_key)
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def read_temp(path):
+    """CPU temperature in Celsius, or None when unreadable or implausible.
+
+    None means "unknown" and must stay distinguishable from a real reading;
+    substituting a comfortable default here is what let the original version
+    keep a fan slow while it had no idea how hot the machine was.
+    """
+    if not path:
+        return None
+    raw = read_int(path)
+    if raw is None:
+        return None
+    celsius = raw // 1000
+    if not -50 < celsius < 150:
+        return None
+    return celsius
+
+
+def lock_path_for(cache_path):
+    """Keep the lock beside the cache so a custom --cache stays self-consistent."""
+    return os.path.join(os.path.dirname(cache_path) or ".", "fancontrol.lock")
+
+
+def acquire_lock(path=LOCK_FILE):
+    """Exclusive advisory lock shared by run and calibrate.
+
+    Without it an operator running `calibrate` while the service is running
+    would have two writers on the same PWM registers.
+    """
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handle = open(path, "w", encoding="ascii")  # noqa: SIM115 - held process-long
+    except OSError as exc:
+        raise FanError("cannot open lock file %s: %s" % (path, exc))
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise FanError(
+            "another qnap-tsx70-fancontrol instance holds %s. Stop the service "
+            "first: systemctl stop qnap-tsx70-fancontrol" % path)
+    try:
+        handle.write("%d\n" % os.getpid())
+        handle.flush()
+    except OSError:
+        pass
+    return handle
+
+
+class FanController:
+    """Owns every register write and knows how to put the chip back."""
+
+    def __init__(self, device, dry_run=False):
+        self.device = device
+        self.dry_run = dry_run
+        self._original = {}
+        self._write_failures = 0
+
+    # -- paths -------------------------------------------------------------
+    def _path(self, name):
+        return os.path.join(self.device, name)
+
+    # -- discovery ---------------------------------------------------------
+    def channels(self):
+        """All channel numbers the chip exposes a tachometer for."""
+        found = []
+        for path in glob.glob(self._path("fan*_input")):
+            num = os.path.basename(path)[len("fan"):-len("_input")]
+            if num.isdigit():
+                found.append(int(num))
+        return sorted(found)
+
+    def rpm(self, channel):
+        return read_int(self._path("fan%d_input" % channel)) or 0
+
+    def pwm(self, channel):
+        return read_int(self._path("pwm%d" % channel))
+
+    def enable_mode(self, channel):
+        return read_int(self._path("pwm%d_enable" % channel))
+
+    def controllable(self, channel):
+        """A channel is only usable when both duty registers exist and write."""
+        for name in ("pwm%d" % channel, "pwm%d_enable" % channel):
+            path = self._path(name)
+            if not os.path.exists(path):
+                return False
+            if not os.access(path, os.W_OK):
+                return False
+        return True
+
+    def detect_active(self, probe=False, settle=4.0):
+        """Channels with a fan attached.
+
+        Passive detection only reads tachometers. `probe` additionally spins up
+        silent channels, which changes hardware state and is therefore opt-in
+        and never used by `run`.
+        """
+        active = []
+        for channel in self.channels():
+            if self.rpm(channel) > 0:
+                active.append(channel)
+                continue
+            if not probe or not self.controllable(channel):
+                continue
+            with self.borrowed(channel):
+                self.set_manual(channel)
+                self.set_pwm(channel, PWM_MAX)
+                time.sleep(settle)
+                if self.rpm(channel) > 0:
+                    active.append(channel)
+        return sorted(active)
+
+    # -- register state ----------------------------------------------------
+    def remember(self, channel):
+        """Snapshot a channel's registers once, before the first write."""
+        if channel in self._original:
+            return
+        self._original[channel] = {
+            "pwm": self.pwm(channel),
+            "enable": self.enable_mode(channel),
+        }
+
+    def _record_write(self, ok):
+        """Track consecutive write failures so a dead path cannot look healthy."""
+        if ok:
+            self._write_failures = 0
+        else:
+            self._write_failures += 1
+        return ok
+
+    @property
+    def write_failures(self):
+        return self._write_failures
+
+    def set_manual(self, channel):
+        self.remember(channel)
+        if self.dry_run:
+            return True
+        ok = write_sysfs(self._path("pwm%d_enable" % channel), PWM_MANUAL)
+        time.sleep(0.2)
+        return self._record_write(ok)
+
+    def set_auto(self, channel):
+        if self.dry_run:
+            return True
+        return self._record_write(
+            write_sysfs(self._path("pwm%d_enable" % channel), PWM_AUTOMATIC))
+
+    def set_pwm(self, channel, value):
+        self.remember(channel)
+        if self.dry_run:
+            return True
+        return self._record_write(
+            write_sysfs(self._path("pwm%d" % channel), clamp_pwm(value)))
+
+    def restore(self, channel):
+        """Return one channel to exactly the state observed before this run."""
+        original = self._original.get(channel)
+        if original is None or self.dry_run:
+            return
+        target = original.get("pwm")
+        if target is not None:
+            write_sysfs(self._path("pwm%d" % channel), clamp_pwm(target))
+            if original.get("enable") == PWM_MANUAL and clamp_pwm(target) < PWM_FLOOR:
+                log("WARN channel %d was already in manual mode below the duty "
+                    "floor (%s); restoring it as found" % (channel, target))
+        mode = original.get("enable")
+        write_sysfs(self._path("pwm%d_enable" % channel),
+                    PWM_AUTOMATIC if mode is None else mode)
+
+    def safe_state(self, channels=None, reason=""):
+        """Force touched channels to full duty and chip-managed automatic mode.
+
+        Called from `finally` blocks and after signals, so it must never raise
+        and must not be interruptible half way: stop signals are blocked for
+        its duration, otherwise a second Ctrl-C could abandon the restore with
+        some channels still parked at a stall duty.
+        """
+        targets = sorted(self._original) if channels is None else sorted(channels)
+        if not targets:
+            return
+        if reason:
+            log("SAFE-STATE %s" % reason)
+        if self.dry_run:
+            log("SAFE-STATE dry run: channels %s left untouched" % targets)
+            return
+        try:
+            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        except (OSError, ValueError, AttributeError):
+            blocked = None
+        try:
+            for channel in targets:
+                try:
+                    write_sysfs(self._path("pwm%d" % channel), SAFE_PWM)
+                    write_sysfs(self._path("pwm%d_enable" % channel),
+                                PWM_AUTOMATIC)
+                    # Read back: a silent restore failure is the one outcome
+                    # this whole mechanism exists to prevent.
+                    mode = self.enable_mode(channel)
+                    if mode not in (None, PWM_AUTOMATIC):
+                        log("ALERT channel %d is still in mode %s after the "
+                            "safe state; check the fan manually"
+                            % (channel, mode))
+                    else:
+                        log("  channel %d -> automatic mode" % channel)
+                except Exception as exc:  # noqa: BLE001 - last line of defence
+                    log("WARN safe state failed on channel %d: %s"
+                        % (channel, exc))
+        finally:
+            if blocked is not None:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+                except (OSError, ValueError):
+                    pass
+
+    class _Borrowed:
+        def __init__(self, controller, channel):
+            self.controller = controller
+            self.channel = channel
+
+        def __enter__(self):
+            self.controller.remember(self.channel)
+            return self.controller
+
+        def __exit__(self, exc_type, exc, tb):
+            if exc_type is not None and issubclass(exc_type, (Terminated, FanError)):
+                self.controller.safe_state([self.channel],
+                                           reason="probe interrupted")
+            else:
+                self.controller.restore(self.channel)
+            return False
+
+    def borrowed(self, channel):
+        """Context manager restoring a channel however the block exits."""
+        return FanController._Borrowed(self, channel)
+
+
+# --------------------------------------------------------------------------
+# Calibration cache
+# --------------------------------------------------------------------------
+
+def load_cache(path=CACHE_FILE):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return validate_cache(json.load(fh))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise FanError("cannot read calibration cache %s: %s" % (path, exc))
+
+
+def save_cache(data, path=CACHE_FILE):
+    """Atomic write so an interrupted save cannot leave a truncated cache."""
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        raise FanError("cannot create %s: %s" % (directory, exc))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".fan-calibration.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise FanError("cannot write %s: %s" % (path, exc))
+
+
+# --------------------------------------------------------------------------
+# Subcommands
+# --------------------------------------------------------------------------
+
+CALIBRATION_WARNING = """
++----------------------------------------------------------------------+
+|  WARNING - calibration deliberately stops the chassis fan.            |
+|                                                                      |
+|  To find the stall and restart duty cycles this procedure lowers the  |
+|  fan until it STOPS SPINNING, leaving the machine with reduced or no  |
+|  airflow for up to %2d seconds at a time.                              |
+|                                                                      |
+|  Do not run it under sustained CPU or disk load, do not walk away,    |
+|  and be ready to power the machine off.                               |
+|                                                                      |
+|  Interrupting is safe: SIGTERM, SIGINT (Ctrl-C), SIGHUP (closing an   |
+|  SSH session) and SIGQUIT all force full duty and hand the fans back  |
+|  to the controller's automatic mode before exiting.                   |
++----------------------------------------------------------------------+
+""" % CALIBRATION_MAX_STALL_S
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise FanError("root privileges are required to write fan registers")
+
+
+def install_signal_handlers():
+    """Install stop handlers. Must run before the first register write."""
+    def handler(signum, _frame):
+        raise Terminated("signal %s" % signal.Signals(signum).name)
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, handler)
+
+
+def cmd_status(args):
+    """Read-only. Never writes a register, so it needs no root and no lock."""
+    report = {"version": VERSION, "device": None, "temperature_c": None,
+              "channels": {}, "cache": None, "cache_path": args.cache}
+    try:
+        device = find_device(args.device_glob)
+        report["device"] = device
+    except FanError as exc:
+        report["error"] = str(exc)
+        device = None
+
+    report["temperature_c"] = read_temp(find_temp_input(args.sensor))
+    if device:
+        controller = FanController(device)
+        for channel in controller.channels():
+            report["channels"][str(channel)] = {
+                "rpm": controller.rpm(channel),
+                "pwm": controller.pwm(channel),
+                "enable": controller.enable_mode(channel),
+                "controllable": controller.controllable(channel),
+            }
+        report["active_channels"] = controller.detect_active(probe=False)
+    try:
+        report["cache"] = load_cache(args.cache)
+    except FanError as exc:
+        report["cache_error"] = str(exc)
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report.get("device") else 1
+
+    log("qnap-tsx70-fancontrol %s" % VERSION)
+    log("controller : %s" % (report["device"] or report.get("error")))
+    log("temperature: %s" % (("%d C" % report["temperature_c"])
+                             if report["temperature_c"] is not None
+                             else "N/A (sensor '%s' not found)" % args.sensor))
+    if report["channels"]:
+        log("channels   :")
+        for channel, data in sorted(report["channels"].items(),
+                                    key=lambda kv: natural_key(kv[0])):
+            log("  fan%s  %5s RPM  pwm=%-4s enable=%-4s controllable=%s"
+                % (channel, data["rpm"], data["pwm"], data["enable"],
+                   data["controllable"]))
+        log("active     : %s" % (report.get("active_channels") or "none"))
+    cache = report.get("cache")
+    if cache:
+        log("calibration: %s (channels %s)" % (args.cache, cache["channels"]))
+        for channel, data in sorted(cache["fans"].items()):
+            log("  fan%s  minstop=%s minstart=%s rpm=%s-%s"
+                % (channel, data["minstop"], data["minstart"],
+                   data["min_rpm"], data["max_rpm"]))
+    else:
+        log("calibration: none at %s%s"
+            % (args.cache, " (%s)" % report["cache_error"]
+               if report.get("cache_error") else ""))
+    return 0 if report.get("device") else 1
+
+
+def cmd_safe_state(args):
+    """Force every channel to automatic mode.
+
+    Used as ExecStopPost so that a SIGKILL, an OOM kill or a crashed
+    interpreter still ends with the chip back in charge of the fans.
+    """
+    require_root()
+    device = find_device(args.device_glob)
+    controller = FanController(device, dry_run=args.dry_run)
+    channels = [c for c in controller.channels() if controller.controllable(c)]
+    if not channels:
+        log("no controllable channels on %s" % device)
+        return 0
+    # No prior snapshot exists in this process, so name the channels directly.
+    for channel in channels:
+        controller.remember(channel)
+    controller.safe_state(channels, reason="requested via safe-state")
+    return 0
+
+
+def _settle(controller, channel, seconds, temp_path, stall_started=None):
+    """Wait, while watching for an overheat or an over-long stall.
+
+    Sleeping in short slices keeps the abort responsive; a plain time.sleep()
+    would happily sit through a thermal excursion with the fan stopped.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+        temp = read_temp(temp_path)
+        if temp is not None and temp >= CALIBRATION_ABORT_TEMP:
+            raise FanError(
+                "aborting calibration: temperature reached %d C (limit %d C)"
+                % (temp, CALIBRATION_ABORT_TEMP))
+        if stall_started is not None and controller.rpm(channel) == 0:
+            stalled_for = time.monotonic() - stall_started
+            if stalled_for > CALIBRATION_MAX_STALL_S:
+                raise FanError(
+                    "aborting calibration: channel %d has been stopped for "
+                    "%.0f s (limit %d s); the fan may be seized or the "
+                    "tachometer dead" % (channel, stalled_for,
+                                         CALIBRATION_MAX_STALL_S))
+
+
+def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
+    """Measure max RPM, stall duty and restart duty for one channel.
+
+    Returns a raw result dict; the caller decides whether it is trustworthy.
+    The caller also owns the safe state - this function only measures.
+    """
+    log("")
+    log("=== calibrating fan%d ===" % channel)
+    result = {"stall_duty": None}
+    controller.set_manual(channel)
+
+    controller.set_pwm(channel, PWM_MAX)
+    _settle(controller, channel, spin, temp_path)
+    result["max_rpm"] = controller.rpm(channel)
+    log("  max RPM at duty %d: %s" % (PWM_MAX, result["max_rpm"]))
+    if not result["max_rpm"]:
+        log("  no rotation at full duty - nothing to calibrate on this channel")
+        return result
+
+    log("  searching stall duty (the fan will stop)...")
+    last_spinning = PWM_MAX
+    for duty in range(120, CALIBRATION_SWEEP_MIN - 1, -5):
+        controller.set_pwm(channel, duty)
+        _settle(controller, channel, settle, temp_path)
+        rpm = controller.rpm(channel)
+        if rpm > 0:
+            last_spinning = duty
+            log("    duty %3d: %s RPM" % (duty, rpm))
+        else:
+            result["stall_duty"] = duty
+            log("    duty %3d: STALLED" % duty)
+            break
+    if result["stall_duty"] is None:
+        # The fan never stopped anywhere in the swept range.
+        result["stall_duty"] = last_spinning
+        log("  never stalled; lowest duty tried was %d and it kept turning"
+            % last_spinning)
+    result["minstop"] = max(PWM_FLOOR, clamp_pwm(last_spinning + 10))
+    log("  lowest spinning duty %d -> minimum %d with margin"
+        % (last_spinning, result["minstop"]))
+
+    log("  searching restart duty...")
+    stall_started = time.monotonic()
+    controller.set_pwm(channel, PWM_MIN)
+    _settle(controller, channel, 2, temp_path, stall_started=stall_started)
+    minstart = None
+    # Start from just below the measured stall point rather than from a fixed
+    # low value: the fan is stopped for this entire sweep, so every skipped
+    # step is airflow the machine does not have.
+    start_duty = max(PWM_FLOOR, clamp_pwm(result["stall_duty"] - 10))
+    for duty in range(start_duty, PWM_MAX + 1, 5):
+        controller.set_pwm(channel, duty)
+        _settle(controller, channel, settle, temp_path,
+                stall_started=stall_started)
+        if controller.rpm(channel) > 0:
+            minstart = duty
+            log("    duty %3d: restarted" % duty)
+            break
+        log("    duty %3d: still stopped" % duty)
+    if minstart is None:
+        raise FanError("channel %d never restarted, even at full duty" % channel)
+    result["minstart"] = max(clamp_pwm(minstart + 10), result["minstop"])
+    log("  restart duty %d -> %d with margin" % (minstart, result["minstart"]))
+
+    controller.set_pwm(channel, result["minstop"])
+    _settle(controller, channel, settle, temp_path)
+    result["min_rpm"] = controller.rpm(channel)
+    log("  RPM at duty %d: %s" % (result["minstop"], result["min_rpm"]))
+
+    # Leave the channel cooling before moving to the next one.
+    controller.set_pwm(channel, SAFE_PWM)
+    return result
+
+
+def cmd_calibrate(args):
+    require_root()
+    device = find_device(args.device_glob)
+    controller = FanController(device, dry_run=args.dry_run)
+
+    if not args.yes:
+        print(CALIBRATION_WARNING)
+        print("Re-run with --yes to confirm you accept the reduced-airflow risk.")
+        return 2
+
+    print(CALIBRATION_WARNING)
+    temp_path = find_temp_input(args.sensor)
+    if temp_path is None and not args.dry_run:
+        raise FanError(
+            "temperature sensor '%s' not found. Calibration stops the fan and "
+            "needs a temperature reading to abort safely; refusing to run "
+            "blind." % args.sensor)
+    start_temp = read_temp(temp_path)
+    if start_temp is None and not args.dry_run:
+        raise FanError("temperature sensor '%s' is unreadable; refusing to run"
+                       % args.sensor)
+    if start_temp is not None and start_temp > CALIBRATION_START_MAX_TEMP:
+        raise FanError(
+            "machine is already at %d C (limit %d C). Let it cool down before "
+            "calibrating." % (start_temp, CALIBRATION_START_MAX_TEMP))
+    log("starting temperature: %s"
+        % ("N/A" if start_temp is None else "%d C" % start_temp))
+
+    # Handlers and lock before the first write, not after.
+    install_signal_handlers()
+    lock = acquire_lock(lock_path_for(args.cache))
+
+    existing = None
+    try:
+        existing = load_cache(args.cache)
+    except FanError as exc:
+        log("WARN %s - it will be replaced" % exc)
+
+    channels = args.channels or controller.detect_active(probe=args.probe)
+    channels = [c for c in channels if controller.controllable(c)]
+    if not channels:
+        raise FanError(
+            "no controllable fan channel is spinning. Use --probe to spin up "
+            "silent channels, or --channels to name them explicitly.")
+    log("channels to calibrate: %s" % channels)
+
+    if existing and sorted(existing["channels"]) == sorted(channels) and not args.force:
+        log("cached calibration already matches channels %s; use --force to redo"
+            % channels)
+        return 0
+
+    results = {}
+    outcome = "aborted"
+    try:
+        for channel in channels:
+            results[channel] = calibrate_channel(controller, channel, temp_path)
+        outcome = "finished"
+    except Terminated as exc:
+        outcome = "interrupted by %s" % exc
+        raise FanError("calibration interrupted by %s before completion" % exc)
+    finally:
+        # Runs on success too: a sweep that visited stall duties must never
+        # leave the chip in manual mode. The reason is reported accurately so
+        # the journal does not claim a clean finish after an interruption.
+        controller.safe_state(reason="calibration %s" % outcome)
+        lock.close()
+
+    usable, rejected = {}, []
+    for channel, result in results.items():
+        if calibration_is_degenerate(result):
+            rejected.append(channel)
+        else:
+            usable[channel] = result
+    for channel in rejected:
+        log("WARN channel %d produced an implausible result and was discarded "
+            "(fan not spinning, or tachometer not reporting)" % channel)
+    if not usable:
+        raise FanError("no channel produced a usable calibration; nothing saved")
+
+    data = validate_cache({"version": 1, "channels": sorted(usable),
+                           "fans": {str(c): v for c, v in usable.items()}})
+    payload = {"version": 1, "channels": data["channels"],
+               "fans": {str(c): v for c, v in data["fans"].items()}}
+    if args.dry_run:
+        log("dry run: calibration not saved")
+    else:
+        save_cache(payload, args.cache)
+        log("saved calibration to %s" % args.cache)
+    for channel, values in sorted(data["fans"].items()):
+        log("  fan%s: %s-%s RPM, duty %s-%s, restart at %s"
+            % (channel, values["min_rpm"], values["max_rpm"],
+               values["minstop"], PWM_MAX, values["minstart"]))
+    log("")
+    log("Start the service when you are ready: systemctl start qnap-tsx70-fancontrol")
+    return 0
+
+
+def cmd_run(args):
+    require_root()
+    device = find_device(args.device_glob)
+    controller = FanController(device, dry_run=args.dry_run)
+    cache = load_cache(args.cache)
+    if cache is None:
+        raise FanError(
+            "no calibration at %s. Run 'qnap-tsx70-fancontrol calibrate --yes' "
+            "first; read docs/FAN_CONTROL.md for the hazard notice." % args.cache)
+
+    channels = [c for c in cache["channels"] if controller.controllable(c)]
+    missing = sorted(set(cache["channels"]) - set(channels))
+    if missing:
+        log("WARN calibrated channels not controllable now: %s" % missing)
+    if not channels:
+        raise FanError("none of the calibrated channels %s exist on %s"
+                       % (cache["channels"], device))
+
+    temp_path = find_temp_input(args.sensor)
+    if temp_path is None:
+        raise FanError("temperature sensor '%s' not found; refusing to run a "
+                       "control loop without a temperature input" % args.sensor)
+
+    install_signal_handlers()
+    lock = acquire_lock(lock_path_for(args.cache))
+    log("qnap-tsx70-fancontrol %s starting" % VERSION)
+    log("  controller : %s" % device)
+    log("  channels   : %s" % channels)
+    log("  sensor     : %s" % temp_path)
+    log("  curve      : %d-%d C -> calibrated minimum..%d"
+        % (args.temp_min, args.temp_max, PWM_MAX))
+    log("  interval   : %ds" % args.interval)
+    if args.dry_run:
+        log("  MODE       : dry run, no register writes")
+
+    running = {c: True for c in channels}
+    kickstarts = {c: 0 for c in channels}
+    temp_failures = 0
+    clean_exit = False
+    try:
+        for channel in channels:
+            controller.set_manual(channel)
+
+        while True:
+            temp = read_temp(temp_path)
+            if temp is None:
+                temp_failures += 1
+                log("WARN temperature unreadable (%d/%d) - forcing full duty"
+                    % (temp_failures, TEMP_FAILURE_LIMIT))
+                for channel in channels:
+                    controller.set_pwm(channel, SAFE_PWM)
+                if temp_failures >= TEMP_FAILURE_LIMIT:
+                    raise FanError(
+                        "temperature input lost for %d consecutive cycles"
+                        % temp_failures)
+                time.sleep(args.interval)
+                continue
+            temp_failures = 0
+
+            for channel in channels:
+                values = cache["fans"].get(channel, {})
+                minimum = max(PWM_FLOOR, clamp_pwm(values.get("minstop", SAFE_PWM)))
+                restart = max(minimum, clamp_pwm(values.get("minstart", SAFE_PWM)))
+                target = calc_pwm(temp, minimum, PWM_MAX,
+                                  args.temp_min, args.temp_max)
+                rpm = controller.rpm(channel)
+                if rpm == 0:
+                    kickstarts[channel] += 1
+                    if kickstarts[channel] >= KICKSTART_LIMIT:
+                        raise FanError(
+                            "channel %d did not restart after %d attempts; the "
+                            "fan may be seized or disconnected"
+                            % (channel, kickstarts[channel]))
+                    # Escalate rather than re-sending the same duty forever.
+                    duty = SAFE_PWM if kickstarts[channel] > 2 else max(target, restart)
+                    if running.get(channel, True):
+                        log("fan%d not turning at %d C, kickstarting at duty %d"
+                            % (channel, temp, duty))
+                    controller.set_pwm(channel, duty)
+                    running[channel] = False
+                else:
+                    if not running.get(channel, True):
+                        log("fan%d turning again (%s RPM)" % (channel, rpm))
+                    running[channel] = True
+                    kickstarts[channel] = 0
+                    controller.set_pwm(channel, target)
+
+            if controller.write_failures >= WRITE_FAILURE_LIMIT:
+                raise FanError(
+                    "%d consecutive register writes failed; the controller is "
+                    "not accepting commands" % controller.write_failures)
+            time.sleep(args.interval)
+    except Terminated as exc:
+        log("stopping on %s" % exc)
+        clean_exit = True
+        return 0
+    finally:
+        # Unconditional: covers the clean stop, FanError, and any unexpected
+        # exception on the way out.
+        controller.safe_state(
+            reason="service stopping" if clean_exit else "control loop failed")
+        lock.close()
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="qnap-tsx70-fancontrol",
+        description="Experimental chassis fan control for QNAP TS-x70 boards.",
+        epilog="Read docs/FAN_CONTROL.md before running calibrate.")
+    parser.add_argument("--version", action="version",
+                        version="qnap-tsx70-fancontrol %s" % VERSION)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--device-glob", default=DEFAULT_DEVICE_GLOB,
+                        help="platform device pattern (default: %(default)s)")
+    common.add_argument("--cache", default=CACHE_FILE,
+                        help="calibration file (default: %(default)s)")
+    common.add_argument("--sensor", default="coretemp",
+                        help="hwmon driver name for CPU temperature "
+                             "(default: %(default)s)")
+    common.add_argument("--dry-run", action="store_true",
+                        help="never write a register; report what would happen")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    status = sub.add_parser("status", parents=[common],
+                            help="report hardware and calibration state")
+    status.add_argument("--json", action="store_true",
+                        help="machine-readable output")
+    status.set_defaults(func=cmd_status)
+
+    calibrate = sub.add_parser(
+        "calibrate", parents=[common],
+        help="HAZARDOUS: measure stall and restart duty cycles")
+    calibrate.add_argument("--yes", action="store_true",
+                           help="confirm the reduced-airflow hazard (required)")
+    calibrate.add_argument("--force", action="store_true",
+                           help="recalibrate even if the cache already matches")
+    calibrate.add_argument("--probe", action="store_true",
+                           help="also spin up channels that read 0 RPM")
+    calibrate.add_argument("--channels", type=int, nargs="+", metavar="N",
+                           help="calibrate these channels instead of detecting")
+    calibrate.set_defaults(func=cmd_calibrate)
+
+    run_cmd = sub.add_parser("run", parents=[common],
+                             help="continuous temperature control loop")
+    run_cmd.add_argument("--interval", type=int, default=INTERVAL,
+                         help="seconds between iterations (default: %(default)s)")
+    run_cmd.add_argument("--temp-min", type=int, default=TEMP_MIN,
+                         help="curve lower bound in C (default: %(default)s)")
+    run_cmd.add_argument("--temp-max", type=int, default=TEMP_MAX,
+                         help="curve upper bound in C (default: %(default)s)")
+    run_cmd.set_defaults(func=cmd_run)
+
+    safe = sub.add_parser("safe-state", parents=[common],
+                          help="force all channels back to automatic mode")
+    safe.set_defaults(func=cmd_safe_state)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except FanError as exc:
+        log("ERROR %s" % exc)
+        return 1
+    except Terminated as exc:
+        log("stopped by %s" % exc)
+        return 0
+    except PermissionError as exc:
+        log("ERROR permission denied: %s" % exc)
+        return 1
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            log("ERROR missing path: %s" % exc)
+            return 1
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main())

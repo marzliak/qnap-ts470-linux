@@ -1,0 +1,85 @@
+# qnap-tsx70-lcd configuration
+#
+# Install to /etc/qnap-tsx70-lcd.conf. Every key below is optional; the value
+# shown is the built-in default. Unknown keys are ignored, and a value that
+# cannot be parsed falls back to the default instead of aborting the service.
+#
+# Restart the service after editing:  systemctl restart qnap-tsx70-lcd
+#
+# The defaults match the reference TS-470 Pro. Other TS-x70 models are
+# unverified - see docs/COMPATIBILITY.md.
+
+# --- Serial port ----------------------------------------------------------
+# Character device wired to the ICP A125 front panel. Verified on the
+# reference TS-470 Pro as /dev/ttyS1 at 1200 baud 8N1. The baud rate is fixed
+# in the protocol layer; only the device path is configurable.
+serial_port = /dev/ttyS1
+
+# Seconds to wait after each line write. At 1200 baud a 20-byte line needs
+# about 167 ms on the wire; values below 0.18 risk corrupted text.
+write_delay = 0.18
+
+# --- Timing ---------------------------------------------------------------
+# Seconds each automatic page stays on screen.
+page_interval = 5.0
+
+# Seconds of button inactivity before disk detail mode returns to automatic.
+detail_timeout = 15.0
+
+# Seconds of button inactivity before the backlight switches off. Set to a
+# very large value to keep the panel lit permanently.
+screen_timeout = 600.0
+
+# Seconds between metric refreshes (temperatures, load, network counters).
+refresh_interval = 10.0
+
+# Seconds between full disk rescans. SMART queries can wake idle drives, so
+# this is deliberately infrequent.
+disk_refresh_interval = 900.0
+
+# Window in seconds in which repeated SELECT presses count as one gesture.
+# Three presses inside this window toggle the backlight.
+multi_press_window = 1.5
+
+# --- Metrics --------------------------------------------------------------
+# Network interface for the throughput page. Empty means "follow the default
+# route", which is usually what you want.
+net_interface =
+
+# hwmon driver names used to locate sensors. Sensors are always resolved by
+# driver name because hwmonN numbering changes between boots. A sensor that is
+# not found renders as N/A rather than failing.
+cpu_temp_sensor = coretemp
+board_temp_sensor = acpitz
+
+# Leave empty to auto-detect a NIC sensor (r8169, then e1000). Set explicitly
+# if your machine exposes several, e.g. nic_temp_sensor = r8169_0_100:00
+nic_temp_sensor =
+
+# Super-I/O platform device providing fan tachometers. A pattern matching more
+# than one device is treated as no match, so the fan page shows N/A rather
+# than reading an unrelated controller.
+fan_device_glob = /sys/devices/platform/f71882fg.*
+
+# Query SMART for disk model, temperature and health. Requires smartmontools.
+# Set to false on systems where smartctl is unavailable or undesirable.
+smart_enabled = true
+
+# --- Pages ----------------------------------------------------------------
+# Comma-separated, displayed in this order. Remove or reorder freely; unknown
+# names are ignored. Run `qnap-tsx70-lcd --list-pages` for the current list.
+#
+#   host     hostname / IP address
+#   cpu      CPU temperature and load average / RAM used and total
+#   uptime   uptime / number of disks online
+#   cpuload  CPU utilisation / date and time
+#   fan      RPM and duty of the channels that are actually spinning
+#   net      receive and transmit throughput
+#   temps    CPU and board temperature / NIC temperature
+pages = host,cpu,uptime,cpuload,fan,net,temps
+
+# strftime format for the date on the cpuload page. Must fit 16 characters;
+# anything longer is truncated. The default is exactly 16 and uses only
+# numeric fields, so it does not grow in other locales the way %b can.
+# Check yours with: qnap-tsx70-lcd --check
+date_format = %H:%M %d/%m/%Y

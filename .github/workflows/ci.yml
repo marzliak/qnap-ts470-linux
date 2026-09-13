@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Least privilege: nothing here needs to write to the repository.
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python compile and tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the supported range, so the version claim in the README
+        # is actually tested rather than asserted.
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "${{ matrix.python-version }}"
+
+      - name: Byte-compile every Python executable
+        run: python3 -m py_compile bin/qnap-tsx70-lcd bin/qnap-tsx70-fancontrol
+
+      - name: Run the test suite
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+  shell:
+    name: Shell syntax and ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n on every shell script
+        run: |
+          set -eu
+          for script in scripts/*.sh; do
+            echo "checking $script"
+            bash -n "$script"
+          done
+
+      # Exercises the installer, uninstaller and diagnostics in dry-run mode.
+      # Syntax checks cannot catch an abort caused by set -o pipefail.
+      - name: Script behaviour (dry run)
+        run: python3 -m unittest tests.test_scripts -v
+        env:
+          PYTHONPATH: tests
+
+      # Pre-installed on ubuntu-latest runners. This is the only place
+      # ShellCheck runs: it is not available in every local environment.
+      - name: ShellCheck
+        run: shellcheck --severity=warning scripts/*.sh
+
+  units:
+    name: systemd unit validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate unit files without installing them
+        run: |
+          set -eu
+          # systemd-analyze also reports problems in unrelated units it loads
+          # from the system search path, so the filter is scoped to ours first.
+          # The missing ExecStart binary is expected: nothing is installed on
+          # the runner. Any other complaint about our units is a real error.
+          output="$(systemd-analyze verify systemd/*.service 2>&1 || true)"
+          echo "$output"
+          filtered="$(echo "$output" \
+            | grep -E 'qnap-tsx70-(lcd|fancontrol)\.service' \
+            | grep -v 'is not executable' || true)"
+          if [ -n "$filtered" ]; then
+            echo "::error::systemd-analyze reported problems in this repo's units"
+            echo "$filtered"
+            exit 1
+          fi
+
+  static:
+    name: Documentation and hygiene checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Standard library only, no third-party link checker: a network-dependent
+      # action would make CI fail for reasons unrelated to the change.
+      - name: Repository hygiene, local links, privacy and naming
+        run: python3 -m unittest discover -s tests -p 'test_repo_*.py' -v

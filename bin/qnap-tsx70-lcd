@@ -1,0 +1,1250 @@
+#!/usr/bin/env python3
+"""qnap-tsx70-lcd - front-panel LCD monitor for QNAP TS-x70 NAS hardware on Linux.
+
+The display is an ICP A125-compatible 2x16 character panel reached over a plain
+serial port (1200 baud 8N1 on the reference TS-470 Pro).
+
+The module is split into three layers so that everything except the final
+os.write() can be exercised without any hardware attached:
+
+  * protocol   - pure byte-frame builders and the button-frame parser
+  * collectors - system metric readers, each degrading to None when absent
+  * renderer   - page functions turning a metric snapshot into two 16-char lines
+
+See docs/LCD_GUIDE.md for operation and docs/LCD_PROTOCOL.md for the wire format.
+"""
+
+import argparse
+import glob
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+VERSION = "2.0.0"
+
+DEFAULT_CONFIG_PATH = "/etc/qnap-tsx70-lcd.conf"
+
+# --------------------------------------------------------------------------
+# Protocol layer - pure functions, no I/O, no system state.
+# --------------------------------------------------------------------------
+
+CMD_PREFIX = 0x4D
+CMD_WRITE = 0x0C
+CMD_BACKLIGHT = 0x5E
+CMD_CLEAR = 0x28
+CMD_STOP_CLOCK = 0x0D
+
+LCD_COLS = 16
+LCD_ROWS = 2
+
+BUTTON_PREFIX = b"\x53\x05\x00"
+BUTTON_FRAME_LEN = len(BUTTON_PREFIX) + 1
+
+BTN_ENTER = 0x01
+BTN_SELECT = 0x02
+BTN_RELEASE = 0x00
+
+
+def pad_line(text):
+    """Encode text to exactly LCD_COLS bytes, truncating or space-padding.
+
+    The panel has no character set negotiation, so anything outside ASCII is
+    replaced rather than sent raw.
+    """
+    raw = str(text).encode("ascii", "replace")[:LCD_COLS]
+    return raw.ljust(LCD_COLS, b" ")
+
+
+def frame_line(row, text):
+    """Single-line write frame: 4D 0C <row> 10 + 16 payload bytes."""
+    if row not in range(LCD_ROWS):
+        raise ValueError("row must be 0 or 1, got %r" % (row,))
+    return bytes([CMD_PREFIX, CMD_WRITE, row, 0x10]) + pad_line(text)
+
+
+def frame_both(line1, line2):
+    """Combined 32-byte write. Only honoured by the panel on the first write."""
+    return (bytes([CMD_PREFIX, CMD_WRITE, 0x00, 0x20])
+            + pad_line(line1) + pad_line(line2))
+
+
+def frame_backlight(on):
+    return bytes([CMD_PREFIX, CMD_BACKLIGHT, 0x01 if on else 0x00])
+
+
+def frame_clear():
+    return bytes([CMD_PREFIX, CMD_CLEAR])
+
+
+def frame_stop_clock():
+    return bytes([CMD_PREFIX, CMD_STOP_CLOCK])
+
+
+class ButtonParser:
+    """Incremental parser for 4-byte button frames.
+
+    A read() on the serial port can return a partial frame, several frames at
+    once, or bytes that are not part of a frame at all. State is kept between
+    feeds so a frame split across two reads is still recognised.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, data):
+        """Append raw bytes and return the list of complete button codes."""
+        self._buf.extend(data)
+        codes = []
+        while True:
+            idx = self._buf.find(BUTTON_PREFIX)
+            if idx < 0:
+                # No frame start. Keep only a trailing fragment that could
+                # still grow into the prefix on the next read.
+                keep = len(BUTTON_PREFIX) - 1
+                if len(self._buf) > keep:
+                    del self._buf[:len(self._buf) - keep]
+                while self._buf and not BUTTON_PREFIX.startswith(bytes(self._buf)):
+                    del self._buf[0]
+                break
+            if idx:
+                del self._buf[:idx]
+            if len(self._buf) < BUTTON_FRAME_LEN:
+                break  # prefix seen, payload byte not here yet
+            codes.append(self._buf[len(BUTTON_PREFIX)])
+            del self._buf[:BUTTON_FRAME_LEN]
+        return codes
+
+    @property
+    def pending(self):
+        """Bytes retained for the next feed. Exposed for tests and diagnostics."""
+        return bytes(self._buf)
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+DEFAULTS = {
+    "serial_port": "/dev/ttyS1",
+    "page_interval": 5.0,
+    "detail_timeout": 15.0,
+    "screen_timeout": 600.0,
+    "refresh_interval": 10.0,
+    "disk_refresh_interval": 900.0,
+    "multi_press_window": 1.5,
+    "write_delay": 0.18,
+    "net_interface": "",
+    "cpu_temp_sensor": "coretemp",
+    "board_temp_sensor": "acpitz",
+    "nic_temp_sensor": "",
+    "fan_device_glob": "/sys/devices/platform/f71882fg.*",
+    "smart_enabled": True,
+    "pages": "host,cpu,uptime,cpuload,fan,net,temps",
+    "date_format": "%H:%M %d/%m/%Y",
+}
+
+BOOL_TRUE = ("1", "true", "yes", "on")
+BOOL_FALSE = ("0", "false", "no", "off")
+
+
+# Writing faster than the 1200 baud line can carry produces garbled text.
+# See docs/LCD_PROTOCOL.md section 4.
+MIN_WRITE_DELAY = 0.18
+MIN_PAGE_INTERVAL = 0.5
+
+
+def apply_limits(conf):
+    """Clamp timing values that would violate the protocol's own limits."""
+    if conf.get("write_delay", MIN_WRITE_DELAY) < MIN_WRITE_DELAY:
+        conf["write_delay"] = MIN_WRITE_DELAY
+    if conf.get("page_interval", MIN_PAGE_INTERVAL) < MIN_PAGE_INTERVAL:
+        conf["page_interval"] = MIN_PAGE_INTERVAL
+    return conf
+
+
+def config_problems(text):
+    """Human-readable complaints about a config body.
+
+    A silently ignored typo is worse than a loud one: the service keeps running
+    with a default the operator thinks they changed.
+    """
+    problems = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            problems.append("line %d: not a key = value pair: %r" % (number, line))
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().lower()
+        if key not in DEFAULTS:
+            problems.append("line %d: unknown key %r" % (number, key))
+            continue
+        default = DEFAULTS[key]
+        value = value.strip().strip('"').strip("'")
+        if isinstance(default, bool):
+            if value.lower() not in BOOL_TRUE + BOOL_FALSE:
+                problems.append("line %d: %s is not a boolean: %r"
+                                % (number, key, value))
+        elif isinstance(default, (int, float)):
+            try:
+                float(value)
+            except ValueError:
+                problems.append("line %d: %s is not a number: %r"
+                                % (number, key, value))
+        elif key == "pages":
+            for name in (p.strip().lower() for p in value.split(",")):
+                if name and name not in PAGES:
+                    problems.append("line %d: unknown page %r" % (number, name))
+    return problems
+
+
+def parse_config(text, defaults=None):
+    """Parse a `key = value` configuration body.
+
+    Unknown keys are ignored so a newer example file cannot break an older
+    binary. Values are coerced to the type of the matching default; a value
+    that will not coerce falls back to the default rather than aborting.
+    """
+    conf = dict(DEFAULTS if defaults is None else defaults)
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().lower()
+        value = value.strip().strip('"').strip("'")
+        if key not in conf:
+            continue
+        default = conf[key]
+        try:
+            if isinstance(default, bool):
+                low = value.lower()
+                if low in BOOL_TRUE:
+                    conf[key] = True
+                elif low in BOOL_FALSE:
+                    conf[key] = False
+            elif isinstance(default, float):
+                conf[key] = float(value)
+            elif isinstance(default, int):
+                conf[key] = int(value)
+            else:
+                conf[key] = value
+        except (TypeError, ValueError):
+            continue
+    return apply_limits(conf)
+
+
+def load_config(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return parse_config(fh.read())
+    except OSError:
+        return apply_limits(dict(DEFAULTS))
+
+
+def enabled_pages(conf):
+    """Ordered list of valid page names from the config, duplicates preserved."""
+    names = [p.strip().lower() for p in str(conf["pages"]).split(",")]
+    return [n for n in names if n in PAGES]
+
+
+# --------------------------------------------------------------------------
+# Formatting helpers - pure.
+# --------------------------------------------------------------------------
+
+NA = "N/A"
+
+
+def fmt_bytes(value):
+    """Compact SI byte-rate string that always fits a 16-char line."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return NA
+    neg = "-" if n < 0 else ""
+    n = abs(n)
+    if n >= 1_000_000_000:
+        return "%s%.1fG" % (neg, n / 1_000_000_000)
+    if n >= 1_000_000:
+        return "%s%.1fM" % (neg, n / 1_000_000)
+    if n >= 1_000:
+        return "%s%.0fK" % (neg, n / 1_000)
+    return "%s%dB" % (neg, n)
+
+
+def fmt_gib(mebibytes):
+    """Mebibytes as a compact gibibyte string, or None when unavailable.
+
+    Returns at most 5 characters so two of them plus a label still fit a row.
+    """
+    try:
+        value = int(mebibytes) / 1024.0
+    except (TypeError, ValueError):
+        return None
+    if value >= 100:
+        return "%.0f" % value
+    return "%.1f" % value
+
+
+def fmt_load(value):
+    """Load average in at most 4 characters.
+
+    Precision is traded for width as the number grows: a busy machine must not
+    push the temperature off the row.
+    """
+    if value is None or value == "":
+        return NA
+    try:
+        load = float(value)
+    except (TypeError, ValueError):
+        return NA
+    for fmt in ("%.2f", "%.1f", "%.0f"):
+        text = fmt % load
+        if len(text) <= 4:
+            return text
+    return "999+"
+
+
+def fmt_uptime(seconds):
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return NA
+    if total < 0:
+        return NA
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return "%dd%dh" % (days, hours)
+    if hours:
+        return "%dh%dm" % (hours, minutes)
+    return "%dm" % minutes
+
+
+def fmt_value(value, suffix=""):
+    """Render an optional metric, falling back to N/A when it is missing."""
+    if value is None or value == "":
+        return NA
+    return "%s%s" % (value, suffix)
+
+
+def millidegrees_to_c(raw):
+    try:
+        return int(raw) // 1000
+    except (TypeError, ValueError):
+        return None
+
+
+def pwm_to_percent(pwm):
+    try:
+        return int(round(int(pwm) / 255 * 100))
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Collectors - every one returns None (or an empty container) when the
+# underlying source is missing. None of them may raise.
+# --------------------------------------------------------------------------
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def run_json(argv, timeout=20):
+    """Run a command without a shell and decode its JSON stdout.
+
+    Tools such as smartctl use nonzero exit codes for advisory conditions, so
+    output is parsed regardless of the return code.
+    """
+    if not shutil.which(argv[0]):
+        return None
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, timeout=timeout,
+            env=dict(os.environ, LC_ALL="C"), check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def find_hwmon(name):
+    """Return the hwmon directory whose `name` file matches, else None.
+
+    hwmonN indices are not stable across boots or kernel versions, so there is
+    deliberately no numeric fallback: an absent sensor reads as absent.
+    """
+    if not name:
+        return None
+    for path in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if read_text(os.path.join(path, "name")) == name:
+            return path
+    return None
+
+
+def find_hwmon_prefix(prefix):
+    """First hwmon whose name starts with `prefix` (e.g. the r8169 NIC sensor)."""
+    if not prefix:
+        return None
+    for path in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name = read_text(os.path.join(path, "name"))
+        if name and name.startswith(prefix):
+            return path
+    return None
+
+
+def hwmon_temp(path):
+    """Read the first available temperature input of an hwmon directory."""
+    if not path:
+        return None
+    candidates = [os.path.join(path, "temp1_input")]
+    candidates += sorted(glob.glob(os.path.join(path, "temp*_input")))
+    for candidate in candidates:
+        value = millidegrees_to_c(read_text(candidate))
+        if value is not None:
+            return value
+    return None
+
+
+def find_fan_device(pattern):
+    """Resolve the Super-I/O platform device directory, or None when unclear.
+
+    Multiple matches are treated as no match: guessing which controller drives
+    the chassis fan is exactly the kind of assumption this project removed.
+    """
+    matches = sorted(p for p in glob.glob(pattern) if os.path.isdir(p))
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def read_fan_channels(device):
+    """Map channel -> {rpm, pwm, percent} for every fanN_input the chip exposes."""
+    channels = {}
+    if not device:
+        return channels
+    for path in sorted(glob.glob(os.path.join(device, "fan*_input"))):
+        base = os.path.basename(path)
+        num = base[len("fan"):-len("_input")]
+        if not num.isdigit():
+            continue
+        rpm = read_text(path)
+        try:
+            rpm = int(rpm)
+        except (TypeError, ValueError):
+            continue
+        pwm = read_text(os.path.join(device, "pwm%s" % num))
+        try:
+            pwm = int(pwm)
+        except (TypeError, ValueError):
+            pwm = None
+        channels[int(num)] = {
+            "rpm": rpm, "pwm": pwm, "percent": pwm_to_percent(pwm),
+        }
+    return channels
+
+
+def active_fan_channels(channels):
+    """Channels currently reporting rotation.
+
+    Channel numbering is hardware- and unit-specific; the reference TS-470 Pro
+    reports only channel 3 spinning. Nothing here may assume a fixed channel.
+    """
+    return sorted(ch for ch, data in channels.items() if data.get("rpm", 0) > 0)
+
+
+def read_cpu_ticks():
+    line = read_text("/proc/stat")
+    if not line:
+        return None
+    parts = line.split("\n", 1)[0].split()
+    if len(parts) < 8 or parts[0] != "cpu":
+        return None
+    try:
+        values = [int(x) for x in parts[1:8]]
+    except ValueError:
+        return None
+    idle = values[3] + values[4]
+    return idle, sum(values)
+
+
+def cpu_percent(previous, current):
+    """CPU busy percentage between two /proc/stat samples, or None."""
+    if not previous or not current:
+        return None
+    d_idle = current[0] - previous[0]
+    d_total = current[1] - previous[1]
+    if d_total <= 0:
+        return None
+    return int(round(100 * (d_total - d_idle) / d_total))
+
+
+def read_loadavg():
+    raw = read_text("/proc/loadavg")
+    return raw.split()[0] if raw else None
+
+
+def read_memory():
+    """(used_mib, total_mib) derived from /proc/meminfo, or (None, None)."""
+    raw = read_text("/proc/meminfo")
+    if not raw:
+        return None, None
+    fields = {}
+    for line in raw.splitlines():
+        key, _, rest = line.partition(":")
+        value = rest.strip().split(" ")[0]
+        if value.isdigit():
+            fields[key] = int(value)
+    total = fields.get("MemTotal")
+    available = fields.get("MemAvailable")
+    if total is None:
+        return None, None
+    if available is None:
+        available = fields.get("MemFree", 0) + fields.get("Cached", 0)
+    return (total - available) // 1024, total // 1024
+
+
+def read_uptime():
+    raw = read_text("/proc/uptime")
+    if not raw:
+        return None
+    try:
+        return float(raw.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def default_interface():
+    """Interface holding the default route, read from /proc/net/route."""
+    raw = read_text("/proc/net/route")
+    if not raw:
+        return None
+    for line in raw.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) > 2 and fields[1] == "00000000":
+            return fields[0]
+    return None
+
+
+def read_net_bytes(iface):
+    if not iface:
+        return None
+    base = "/sys/class/net/%s/statistics" % iface
+    rx = read_text(os.path.join(base, "rx_bytes"))
+    tx = read_text(os.path.join(base, "tx_bytes"))
+    try:
+        return int(rx), int(tx)
+    except (TypeError, ValueError):
+        return None
+
+
+def net_rates(previous, current, elapsed):
+    """(rx_per_s, tx_per_s) between two counter samples, or (None, None)."""
+    if not previous or not current or elapsed <= 0:
+        return None, None
+    rx = current[0] - previous[0]
+    tx = current[1] - previous[1]
+    if rx < 0 or tx < 0:  # counter wrap or interface reset
+        return None, None
+    return int(rx / elapsed), int(tx / elapsed)
+
+
+def primary_ip():
+    """Local address of the default route, without spawning a shell."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # TEST-NET-1; a UDP connect only selects a route, it sends nothing.
+            sock.connect(("192.0.2.1", 9))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
+    except OSError:
+        return None
+
+
+def list_block_devices():
+    """Physical disks via `lsblk --json`, tolerant of older field sets."""
+    data = run_json(["lsblk", "--json", "-d", "-b",
+                     "-o", "NAME,SIZE,MODEL,TYPE"], timeout=15)
+    devices = []
+    if not data:
+        return devices
+    for entry in data.get("blockdevices", []) or []:
+        if entry.get("type") != "disk":
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        devices.append({
+            "name": name,
+            "path": "/dev/%s" % name,
+            "size": human_size(entry.get("size")),
+            "model": (entry.get("model") or "").strip() or None,
+        })
+    return devices
+
+
+def human_size(num_bytes):
+    try:
+        n = float(num_bytes)
+    except (TypeError, ValueError):
+        return None
+    for unit in ("B", "K", "M", "G", "T", "P"):
+        if n < 1024 or unit == "P":
+            return "%.0f%s" % (n, unit) if unit in ("B", "K") else "%.1f%s" % (n, unit)
+        n /= 1024
+    return None
+
+
+def smart_attribute(data, attr_id):
+    """Raw value of an ATA SMART attribute id, or None when not reported."""
+    try:
+        table = data["ata_smart_attributes"]["table"]
+    except (KeyError, TypeError):
+        return None
+    for row in table or []:
+        if row.get("id") == attr_id:
+            raw = row.get("raw", {})
+            value = raw.get("value")
+            if value is not None:
+                return value
+            return raw.get("string")
+    return None
+
+
+def read_smart(path):
+    """SMART summary for one device. Every field is optional.
+
+    NVMe, USB bridges and older smartctl builds all report different subsets,
+    so missing keys are normal and never fatal.
+    """
+    info = {"model": None, "temp": None, "hours": None, "cycles": None,
+            "realloc": None, "pending": None, "health": None}
+    data = run_json(["smartctl", "--json", "-H", "-A", "-i", path])
+    if not data:
+        return info
+    device = data.get("device")
+    if not isinstance(device, dict):
+        device = {}
+    info["model"] = data.get("model_name") or device.get("name")
+    temp = data.get("temperature", {})
+    if isinstance(temp, dict):
+        info["temp"] = temp.get("current")
+    hours = data.get("power_on_time", {})
+    if isinstance(hours, dict):
+        info["hours"] = hours.get("hours")
+    info["cycles"] = data.get("power_cycle_count")
+    info["realloc"] = smart_attribute(data, 5)
+    info["pending"] = smart_attribute(data, 197)
+    status = data.get("smart_status", {})
+    if isinstance(status, dict) and "passed" in status:
+        info["health"] = "OK" if status["passed"] else "FAIL"
+    return info
+
+
+def collect_disks(smart_enabled=True):
+    disks = []
+    for device in list_block_devices():
+        entry = dict(device)
+        entry.update({"temp": None, "hours": None, "cycles": None,
+                      "realloc": None, "pending": None, "health": None})
+        if smart_enabled:
+            smart = read_smart(device["path"])
+            for key, value in smart.items():
+                if value is not None or key not in entry or entry.get(key) is None:
+                    entry[key] = value if value is not None else entry.get(key)
+        disks.append(entry)
+    return disks
+
+
+# --------------------------------------------------------------------------
+# Renderer - snapshot dict in, two lines out. Pure and fully testable.
+# --------------------------------------------------------------------------
+
+def page_host(s):
+    return (s.get("hostname") or NA, fmt_value(s.get("ip")))
+
+
+def page_cpu(s):
+    used = fmt_gib(s.get("mem_used"))
+    total = fmt_gib(s.get("mem_total"))
+    ram = ("RAM %s" % NA if used is None or total is None
+           else "RAM %s/%sG" % (used, total))
+    return ("CPU:%s L:%s" % (fmt_value(s.get("cpu_temp"), "C"),
+                             fmt_load(s.get("load"))),
+            ram)
+
+
+def page_uptime(s):
+    count = NA if s.get("disk_count") is None else str(s["disk_count"])
+    line2 = "%s disks online" % count
+    if len(line2) > LCD_COLS:
+        line2 = "Disks: %s" % count
+    return ("Uptime:%s" % fmt_uptime(s.get("uptime")), line2)
+
+
+def page_cpuload(s):
+    used = s.get("cpu_pct")
+    return ("CPU Use: %s" % (NA if used is None else "%d%%" % used),
+            s.get("datetime") or NA)
+
+
+def page_fan(s):
+    """Report the channels that are actually spinning, not a fixed channel."""
+    channels = s.get("fan_channels") or {}
+    active = active_fan_channels(channels)
+    if not active:
+        return ("Fan: %s" % NA, "no fan detected")
+    first = channels[active[0]]
+    line1 = "Fan%d: %s RPM" % (active[0], first.get("rpm", NA))
+    if len(active) > 1:
+        second = channels[active[1]]
+        return (line1, "Fan%d: %s RPM" % (active[1], second.get("rpm", NA)))
+    pct = first.get("percent")
+    return (line1, "Duty: %s" % (NA if pct is None else "%d%%" % pct))
+
+
+def page_net(s):
+    return ("Net Rx:%s" % fmt_bytes(s.get("rx_rate")),
+            "Net Tx:%s" % fmt_bytes(s.get("tx_rate")))
+
+
+def page_temps(s):
+    return ("CPU:%s Bd:%s" % (fmt_value(s.get("cpu_temp"), "C"),
+                              fmt_value(s.get("board_temp"), "C")),
+            "NIC:%s" % fmt_value(s.get("nic_temp"), "C"))
+
+
+PAGES = {
+    "host": page_host,
+    "cpu": page_cpu,
+    "uptime": page_uptime,
+    "cpuload": page_cpuload,
+    "fan": page_fan,
+    "net": page_net,
+    "temps": page_temps,
+}
+
+
+def detail_pages(disk):
+    """Four SMART pages for one disk. Absent attributes render as N/A."""
+    realloc = disk.get("realloc")
+    warn = ""
+    try:
+        # Just a marker here; the count itself is on page 3.
+        if realloc is not None and int(realloc) > 0:
+            warn = "!"
+    except (TypeError, ValueError):
+        pass
+    # The device name is already on the header row, so it is not repeated.
+    summary = "%s %s %s" % (disk.get("size") or NA,
+                            fmt_value(disk.get("temp"), "C"),
+                            disk.get("health") or NA)
+    # Surface the warning on the summary page when there is room for it; the
+    # count itself is always on the reallocated-sectors page either way.
+    if warn and len(summary) < LCD_COLS:
+        summary += warn
+    return [
+        summary,
+        disk.get("model") or NA,
+        "Realloc:%s%s" % (fmt_value(disk.get("realloc")), warn),
+        "Pending:%s" % fmt_value(disk.get("pending")),
+        "%sh %sc" % (fmt_value(disk.get("hours")),
+                     fmt_value(disk.get("cycles"))),
+    ]
+
+
+# --------------------------------------------------------------------------
+# Device layer
+# --------------------------------------------------------------------------
+
+class LcdError(RuntimeError):
+    """The panel could not be opened. Carries an actionable message."""
+
+
+def open_device(conf):
+    """Open the panel, turning the usual failures into advice.
+
+    A bare OSError traceback here is the first thing a new user would see, on
+    the very step the README tells them to run first.
+    """
+    import termios  # for termios.error, which is not an OSError subclass
+
+    port = conf["serial_port"]
+    try:
+        return LcdDevice(port, conf["write_delay"])
+    except termios.error as exc:
+        raise LcdError(
+            "%s is not a serial port (%s). The panel is on a UART such as "
+            "/dev/ttyS1; run 'qnap-tsx70-lcd --check'." % (port, exc))
+    except IsADirectoryError:
+        raise LcdError("%s is a directory, not a serial port." % port)
+    except FileNotFoundError:
+        raise LcdError(
+            "serial port %s does not exist. Run 'qnap-tsx70-lcd --check' to "
+            "see what this machine exposes, and --port to try another." % port)
+    except PermissionError:
+        raise LcdError(
+            "permission denied opening %s. This needs root; try sudo." % port)
+    except OSError as exc:
+        raise LcdError(
+            "cannot open %s: %s. Run 'qnap-tsx70-lcd --check', and check "
+            "nothing else holds the port (fuser -v %s)."
+            % (port, exc.strerror or exc, port))
+
+
+class LcdDevice:
+    """Serial transport. The only component that touches the hardware."""
+
+    def __init__(self, port, write_delay=0.18):
+        import termios  # imported lazily so the module loads on any platform
+        self._termios = termios
+        self.port = port
+        self.write_delay = write_delay
+        self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        attrs = termios.tcgetattr(self.fd)
+        attrs[0] = 0                                              # iflag
+        attrs[1] = 0                                              # oflag
+        attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL   # cflag
+        attrs[3] = 0                                              # lflag: raw
+        attrs[4] = termios.B1200                                  # ispeed
+        attrs[5] = termios.B1200                                  # ospeed
+        attrs[6][termios.VMIN] = 0
+        attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+
+    def send(self, payload, delay=None):
+        os.write(self.fd, payload)
+        time.sleep(self.write_delay if delay is None else delay)
+
+    def write_lines(self, line1, line2):
+        # Each line is sent separately: the 32-byte combined write is only
+        # honoured by the A125 on the very first write after power-up.
+        self.send(frame_line(0, line1))
+        self.send(frame_line(1, line2))
+
+    def backlight(self, on):
+        self.send(frame_backlight(on), delay=0.05)
+
+    def clear(self):
+        self.send(frame_clear(), delay=0.05)
+
+    def read_raw(self, size=64):
+        try:
+            return os.read(self.fd, size)
+        except (BlockingIOError, OSError):
+            return b""
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Monitor
+# --------------------------------------------------------------------------
+
+class Monitor:
+    def __init__(self, conf):
+        self.conf = conf
+        self.pages = enabled_pages(conf) or list(DEFAULTS["pages"].split(","))
+        self.buttons = ButtonParser()
+        self.snapshot = {}
+        self.disks = []
+        # Primed here so the first rendered page shows a real utilisation
+        # figure rather than N/A for one cycle.
+        self._prev_ticks = read_cpu_ticks()
+        self._prev_net = None
+        self._prev_net_time = None
+        self._cpu_paths = {}
+        self._last_sensor_scan = 0.0
+
+    # -- sensors -----------------------------------------------------------
+    def rescan_sensors(self):
+        """Re-resolve hwmon directories; indices move across boots and reloads."""
+        conf = self.conf
+        nic = (find_hwmon(conf["nic_temp_sensor"]) if conf["nic_temp_sensor"]
+               else find_hwmon_prefix("r8169") or find_hwmon_prefix("e1000"))
+        self._cpu_paths = {
+            "cpu": find_hwmon(conf["cpu_temp_sensor"]),
+            "board": find_hwmon(conf["board_temp_sensor"]),
+            "nic": nic,
+            "fan": find_fan_device(conf["fan_device_glob"]),
+        }
+        self._last_sensor_scan = time.time()
+
+    def refresh(self):
+        conf = self.conf
+        if not self._cpu_paths or time.time() - self._last_sensor_scan > 300:
+            self.rescan_sensors()
+        paths = self._cpu_paths
+
+        ticks = read_cpu_ticks()
+        pct = cpu_percent(self._prev_ticks, ticks)
+        if ticks:
+            self._prev_ticks = ticks
+
+        iface = conf["net_interface"] or default_interface()
+        now = time.time()
+        net = read_net_bytes(iface)
+        rx_rate, tx_rate = net_rates(self._prev_net, net,
+                                     now - (self._prev_net_time or now))
+        if net:
+            self._prev_net = net
+            self._prev_net_time = now
+
+        mem_used, mem_total = read_memory()
+        self.snapshot = {
+            "hostname": (socket.gethostname() or "").upper() or None,
+            "ip": primary_ip(),
+            "cpu_temp": hwmon_temp(paths.get("cpu")),
+            "board_temp": hwmon_temp(paths.get("board")),
+            "nic_temp": hwmon_temp(paths.get("nic")),
+            "load": read_loadavg(),
+            "mem_used": mem_used,
+            "mem_total": mem_total,
+            "uptime": read_uptime(),
+            "cpu_pct": pct if pct is not None else self.snapshot.get("cpu_pct"),
+            "datetime": time.strftime(conf["date_format"]),
+            "fan_channels": read_fan_channels(paths.get("fan")),
+            "rx_rate": rx_rate,
+            "tx_rate": tx_rate,
+            "disk_count": len(self.disks),
+        }
+
+    def refresh_disks(self):
+        self.disks = collect_disks(self.conf["smart_enabled"])
+        self.snapshot["disk_count"] = len(self.disks)
+
+    def render(self, index):
+        name = self.pages[index % len(self.pages)]
+        return PAGES[name](self.snapshot)
+
+
+def preflight(conf, verbose=True, config_path=None):
+    """Non-destructive readiness check. Returns (ok, list_of_report_lines)."""
+    lines = []
+    ok = True
+
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, encoding="utf-8", errors="replace") as fh:
+                problems = config_problems(fh.read())
+        except OSError as exc:
+            problems = ["cannot read %s: %s" % (config_path, exc)]
+        for problem in problems:
+            lines.append("warn config %s" % problem)
+        if not problems:
+            lines.append("ok   config %s parses cleanly" % config_path)
+    port = conf["serial_port"]
+    if not os.path.exists(port):
+        lines.append("FAIL serial port %s does not exist" % port)
+        ok = False
+    else:
+        import stat as stat_mod
+        mode = os.stat(port).st_mode
+        if not stat_mod.S_ISCHR(mode):
+            lines.append("FAIL %s is not a character device" % port)
+            ok = False
+        elif not os.access(port, os.R_OK | os.W_OK):
+            lines.append("FAIL %s is not readable/writable by uid %d"
+                         % (port, os.geteuid()))
+            ok = False
+        else:
+            lines.append("ok   serial port %s" % port)
+
+    for label, key in (("CPU temp", "cpu_temp_sensor"),
+                       ("board temp", "board_temp_sensor")):
+        path = find_hwmon(conf[key])
+        lines.append("%s %s sensor '%s'%s" % (
+            "ok  " if path else "warn", label, conf[key],
+            "" if path else " not found - page shows N/A"))
+
+    fan = find_fan_device(conf["fan_device_glob"])
+    if fan:
+        channels = read_fan_channels(fan)
+        active = active_fan_channels(channels)
+        lines.append("ok   fan controller %s (active channels: %s)"
+                     % (fan, active or "none"))
+    else:
+        lines.append("warn no unambiguous fan controller for %s - fan page N/A"
+                     % conf["fan_device_glob"])
+
+    if conf["smart_enabled"]:
+        if shutil.which("smartctl"):
+            lines.append("ok   smartctl available")
+        else:
+            lines.append("warn smartctl not installed - disk detail shows N/A")
+    if not shutil.which("lsblk"):
+        lines.append("warn lsblk not installed - no disks will be listed")
+
+    disks = list_block_devices()
+    lines.append("ok   %d disk(s) detected" % len(disks))
+    rendered = time.strftime(conf["date_format"])
+    if len(rendered) > LCD_COLS:
+        lines.append("warn date_format renders %d characters (%r); it will be "
+                     "truncated to %d" % (len(rendered), rendered, LCD_COLS))
+    else:
+        lines.append("ok   date_format fits (%r)" % rendered)
+
+    pages = enabled_pages(conf)
+    lines.append("ok   %d page(s) enabled: %s" % (len(pages), ",".join(pages)))
+    if not pages:
+        lines.append("warn no valid pages configured - defaults will be used")
+
+    if verbose:
+        for line in lines:
+            print(line)
+    return ok, lines
+
+
+# --------------------------------------------------------------------------
+# Main loop
+# --------------------------------------------------------------------------
+
+def run(conf):
+    monitor = Monitor(conf)
+    device = open_device(conf)
+    page_interval = conf["page_interval"]
+    detail_timeout = conf["detail_timeout"]
+    screen_timeout = conf["screen_timeout"]
+    press_window = conf["multi_press_window"]
+
+    state = {
+        "mode": "auto", "auto_idx": 0, "disk_idx": 0, "detail_page": 0,
+        "last_button": time.time(), "last_activity": time.time(),
+        "screen_on": True, "selects": [],
+    }
+
+    def sleep_screen():
+        state["screen_on"] = False
+        state["mode"] = "auto"
+        device.backlight(False)
+        device.write_lines("", "")
+
+    def wake_screen():
+        state["screen_on"] = True
+        device.backlight(True)
+
+    def enter_detail():
+        state["mode"] = "detail"
+        state["disk_idx"] = 0
+        state["detail_page"] = 0
+
+    def on_button(code, now):
+        state["last_activity"] = now
+        if not state["screen_on"]:
+            if code in (BTN_ENTER, BTN_SELECT):
+                wake_screen()
+                state["mode"] = "auto"
+            return
+        if code == BTN_SELECT:
+            selects = [t for t in state["selects"] if now - t < press_window]
+            selects.append(now)
+            state["selects"] = selects
+            if len(selects) >= 3:
+                state["selects"] = []
+                sleep_screen()
+        elif code == BTN_ENTER:
+            state["selects"] = []
+            if state["mode"] == "detail":
+                pages = len(detail_pages(monitor.disks[state["disk_idx"]])) \
+                    if monitor.disks else 1
+                state["detail_page"] = (state["detail_page"] + 1) % pages
+            elif monitor.disks:
+                enter_detail()
+            state["last_button"] = now
+
+    def settle_selects(now):
+        """A SELECT burst is only acted on once the multi-press window closes."""
+        selects = state["selects"]
+        if not selects or now - selects[-1] <= press_window:
+            return
+        state["selects"] = []
+        if not monitor.disks:
+            return
+        if state["mode"] == "auto":
+            enter_detail()
+        else:
+            state["disk_idx"] += 1
+            state["detail_page"] = 0
+            if state["disk_idx"] >= len(monitor.disks):
+                state["mode"] = "auto"
+                state["disk_idx"] = 0
+        state["last_button"] = now
+
+    def poll_buttons():
+        now = time.time()
+        for code in monitor.buttons.feed(device.read_raw()):
+            if code != BTN_RELEASE:
+                on_button(code, now)
+        settle_selects(now)
+
+    monitor.refresh_disks()
+    monitor.refresh()
+    device.backlight(True)
+    last_refresh = time.time()
+    last_disk_scan = time.time()
+
+    try:
+        while True:
+            now = time.time()
+            if state["screen_on"] and now - state["last_activity"] > screen_timeout:
+                sleep_screen()
+            if now - last_refresh > conf["refresh_interval"]:
+                monitor.refresh()
+                last_refresh = now
+            if now - last_disk_scan > conf["disk_refresh_interval"]:
+                monitor.refresh_disks()
+                last_disk_scan = now
+
+            poll_buttons()
+
+            if not state["screen_on"]:
+                time.sleep(0.3)
+                continue
+
+            if state["mode"] == "detail" and now - state["last_button"] > detail_timeout:
+                state["mode"] = "auto"
+
+            # A disk can disappear between refreshes; never index past the end.
+            if state["mode"] == "detail" and state["disk_idx"] >= len(monitor.disks):
+                state["mode"] = "auto"
+                state["disk_idx"] = 0
+
+            if state["mode"] == "auto":
+                line1, line2 = monitor.render(state["auto_idx"])
+                device.write_lines(line1, line2)
+                state["auto_idx"] += 1
+                deadline = time.time() + page_interval
+                while time.time() < deadline:
+                    time.sleep(0.2)
+                    poll_buttons()
+                    if not state["screen_on"] or state["mode"] == "detail":
+                        break
+            else:
+                disk = monitor.disks[state["disk_idx"]]
+                pages = detail_pages(disk)
+                index = state["detail_page"] % len(pages)
+                device.write_lines(
+                    "[%s] %d/%d" % (disk.get("name") or "?",
+                                    index + 1, len(pages)),
+                    pages[index])
+                time.sleep(0.3)
+    finally:
+        device.close()
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="qnap-tsx70-lcd",
+        description="Front-panel LCD monitor for QNAP TS-x70 hardware on Linux.")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
+                        help="configuration file (default: %(default)s)")
+    parser.add_argument("--port", help="override the configured serial port")
+    parser.add_argument("--version", action="version",
+                        version="qnap-tsx70-lcd %s" % VERSION)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true",
+                      help="preflight only; never writes to the display")
+    mode.add_argument("--once", action="store_true",
+                      help="render one page and exit")
+    mode.add_argument("--test-message", nargs="?", const="qnap-tsx70|LCD test OK",
+                      metavar="LINE1|LINE2",
+                      help="write a test message and exit (reversible)")
+    mode.add_argument("--clear", action="store_true",
+                      help="clear the display, switch the backlight off and exit")
+    mode.add_argument("--list-pages", action="store_true",
+                      help="list available page names and exit")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    conf = load_config(args.config)
+    if args.port:
+        conf["serial_port"] = args.port
+
+    if args.list_pages:
+        for name in PAGES:
+            print(name)
+        return 0
+
+    if args.check:
+        ok, _ = preflight(conf, config_path=args.config)
+        return 0 if ok else 1
+
+    if args.test_message is not None:
+        line1, _, line2 = args.test_message.partition("|")
+        device = open_device(conf)
+        try:
+            device.backlight(True)
+            device.write_lines(line1, line2)
+        finally:
+            device.close()
+        print("Wrote test message. Run --clear to blank the display.")
+        return 0
+
+    if args.clear:
+        device = open_device(conf)
+        try:
+            # Send the documented clear command, then blank both rows as well:
+            # the rows are what actually guarantees a blank panel if a given
+            # unit ignores the clear opcode.
+            device.clear()
+            device.write_lines("", "")
+            device.backlight(False)
+        finally:
+            device.close()
+        return 0
+
+    if args.once:
+        monitor = Monitor(conf)
+        monitor.refresh_disks()
+        monitor.refresh()
+        line1, line2 = monitor.render(0)
+        device = open_device(conf)
+        try:
+            device.backlight(True)
+            device.write_lines(line1, line2)
+        finally:
+            device.close()
+        print("%s\n%s" % (line1, line2))
+        return 0
+
+    try:
+        run(conf)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def cli(argv=None):
+    """Entry point wrapper that turns LcdError into a one-line message."""
+    try:
+        return main(argv)
+    except LcdError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

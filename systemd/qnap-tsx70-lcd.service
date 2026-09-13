@@ -1,0 +1,48 @@
+[Unit]
+Description=QNAP TS-x70 front-panel LCD monitor
+Documentation=https://github.com/marzliak/qnap-ts470-linux/blob/main/docs/LCD_GUIDE.md
+# Ordered after local filesystems rather than after multi-user.target: this
+# unit is itself part of multi-user.target, so ordering after it would be
+# circular in intent even though systemd tolerates it.
+After=local-fs.target
+# A port that is permanently missing or held by something else would
+# otherwise restart every 5 s forever without tripping systemd's
+# default burst limit. Give up and stay visible as a failed unit.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+# Deliberately independent of qnap-tsx70-fancontrol: the display does not need
+# fan control, and fan control is optional and experimental.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/qnap-tsx70-lcd --config /etc/qnap-tsx70-lcd.conf
+ExecStopPost=-/usr/local/bin/qnap-tsx70-lcd --config /etc/qnap-tsx70-lcd.conf --clear
+Restart=always
+RestartSec=5
+
+# Runs as root because smartctl needs raw access to the block devices it
+# queries. The settings below reduce the reachable filesystem and kernel
+# surface; they do NOT reduce the service's privileges over storage devices.
+# Set smart_enabled = false in the config if you do not want that access.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
