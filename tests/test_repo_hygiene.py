@@ -131,12 +131,12 @@ class NamingTests(unittest.TestCase):
             if not os.path.isfile(full):
                 continue
             for number, line in enumerate(read(path).splitlines(), 1):
-                if "MIGRATION_FROM_SATURN" in line or "SATURN" in line.upper()[:0]:
-                    continue
+                # Strip the document name first; what remains must be the
+                # `saturn-*` prefix or nothing.
                 stripped = line.replace(MIGRATION_DOC, "")
-                match = pattern.search(stripped)
                 self.assertIsNone(
-                    match, "%s:%d uses a bare legacy word: %s"
+                    pattern.search(stripped),
+                    "%s:%d uses a bare legacy word: %s"
                     % (path, number, line.strip()))
 
     def test_binaries_use_the_new_prefix(self):
