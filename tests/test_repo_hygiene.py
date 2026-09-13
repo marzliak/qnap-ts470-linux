@@ -378,6 +378,32 @@ class DocumentedConstantTests(unittest.TestCase):
                                  "%s: code says %s, documentation says %s"
                                  % (label, value, match.group(1)))
 
+    def test_the_sweep_bound_is_the_constant_the_docs_describe(self):
+        """The previous drift was between a constant and the range() using it.
+
+        Comparing documentation against PWM_FLOOR could not catch a sweep whose
+        loop bound was written as `PWM_FLOOR - 6`, so the lowest duty actually
+        commanded is asserted here instead.
+        """
+        fan = load_fan()
+        source = read("bin/qnap-tsx70-fancontrol")
+        match = re.search(r"for duty in range\(120, ([A-Za-z_]+) - 1, -5\)",
+                          source)
+        self.assertIsNotNone(
+            match, "the descending sweep no longer uses a named lower bound")
+        self.assertEqual(match.group(1), "CALIBRATION_SWEEP_MIN")
+        lowest = list(range(120, fan.CALIBRATION_SWEEP_MIN - 1, -5))[-1]
+        self.assertEqual(lowest, fan.CALIBRATION_SWEEP_MIN,
+                         "the sweep's lowest commanded duty is %d, not the "
+                         "documented %d" % (lowest, fan.CALIBRATION_SWEEP_MIN))
+        self.assertLess(fan.CALIBRATION_SWEEP_MIN, fan.PWM_FLOOR,
+                        "the sweep must go below the duty floor to find a stall")
+        # And the documentation must acknowledge that it does.
+        doc = read("docs/FAN_CONTROL.md")
+        self.assertIn("Calibration itself is\n   the exception", doc,
+                      "FAN_CONTROL.md no longer notes that calibration goes "
+                      "below the duty floor")
+
     def test_calibration_warning_quotes_the_real_stall_cap(self):
         fan = load_fan()
         self.assertIn("up to %2d seconds" % fan.CALIBRATION_MAX_STALL_S,
