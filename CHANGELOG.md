@@ -108,10 +108,9 @@ automatically — see [docs/MIGRATION_FROM_SATURN.md](docs/MIGRATION_FROM_SATURN
   long a fan may sit stopped, discards implausible results, and takes a lock so
   it cannot run against the service.
 - Kickstart escalation and a give-up threshold for a fan that will not restart.
-- An offline test suite — 233 tests, no hardware required.
+- An offline test suite — 234 tests, no hardware required.
 - GitHub Actions CI: Python compilation and tests, `bash -n` and ShellCheck,
   `systemd-analyze verify`, and static documentation and privacy checks.
-  Staged at `ci/github-actions/ci.yml` pending activation; see `ci/README.md`.
 - An MIT `LICENSE`.
 
 ### Documentation

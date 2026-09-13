@@ -83,21 +83,9 @@ def text_files():
 
 class RequiredArtifactTests(unittest.TestCase):
     def test_the_ci_workflow_is_present(self):
-        """Accepts either location.
-
-        The workflow lives at ci/github-actions/ci.yml because the credential
-        used to open the pull request lacked GitHub's `workflow` OAuth scope,
-        which is required to push anything under .github/workflows/. See
-        ci/README.md for how to activate it.
-        """
-        candidates = [".github/workflows/ci.yml", "ci/github-actions/ci.yml"]
-        present = [c for c in candidates
-                   if os.path.isfile(os.path.join(REPO_ROOT, c))]
-        self.assertTrue(present, "no CI workflow at %s" % " or ".join(candidates))
-        if "ci/github-actions/ci.yml" in present:
-            self.assertTrue(
-                os.path.isfile(os.path.join(REPO_ROOT, "ci/README.md")),
-                "the staged workflow must explain how to activate it")
+        workflow = os.path.join(REPO_ROOT, ".github/workflows/ci.yml")
+        self.assertTrue(os.path.isfile(workflow),
+                        "missing active GitHub Actions workflow")
 
     def test_every_required_file_exists(self):
         for path in REQUIRED_FILES:
