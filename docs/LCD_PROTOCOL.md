@@ -31,7 +31,7 @@ mode `0660`.
 
 Do not assume the node is always `/dev/ttyS1`. Enumeration depends on how many
 UARTs the kernel finds, which varies with the board and the kernel version. The
-path is configurable — see [LCD_GUIDE.md](LCD_GUIDE.md#6-configuration).
+path is configurable — see [LCD_GUIDE.md](LCD_GUIDE.md#8-configuration).
 
 ### Raw setup
 

@@ -84,10 +84,27 @@ class InstallerDryRunTests(unittest.TestCase):
         self.assertIn("[dry-run]", self.result.stdout)
 
     def test_dry_run_changes_nothing_on_disk(self):
-        for path in ("/usr/local/bin/qnap-tsx70-lcd",
-                     "/etc/systemd/system/qnap-tsx70-lcd.service"):
-            self.assertFalse(os.path.exists(path),
-                             "dry run created %s" % path)
+        # Compare before and after rather than asserting absence: on a machine
+        # where the project is genuinely installed, absence is the wrong test.
+        targets = ("/usr/local/bin/qnap-tsx70-lcd",
+                   "/etc/qnap-tsx70-lcd.conf",
+                   "/etc/systemd/system/qnap-tsx70-lcd.service")
+
+        def snapshot():
+            state = {}
+            for path in targets:
+                try:
+                    info = os.stat(path)
+                    state[path] = (info.st_ino, info.st_mtime, info.st_size)
+                except OSError:
+                    state[path] = None
+            return state
+
+        before = snapshot()
+        result = run(["bash", "scripts/install.sh", "--dry-run", "--skip-deps",
+                      "--force"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snapshot(), before, "the dry run modified the system")
 
     def test_lcd_only_is_the_default(self):
         self.assertIn("mode:       LCD only", self.result.stdout)
@@ -170,3 +187,89 @@ class DiagnoseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RollbackReachabilityTests(unittest.TestCase):
+    """A failure inside install_files() must reach rollback().
+
+    Bash does not inherit an ERR trap into shell functions unless `errtrace`
+    is set, so `set -euo pipefail` silently disabled the documented automatic
+    rollback for exactly the two functions that perform the install.
+    """
+
+    PROBE = "scripts/.install-rollback-probe.sh"
+
+    def _build_probe(self, shell_options="set -Eeuo pipefail"):
+        with open(os.path.join(REPO_ROOT, "scripts/install.sh"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        probe = src.replace("set -Eeuo pipefail", shell_options)
+        # Inject a failure at the first statement of install_files.
+        marker = '    run install -d -m 0755 "$STATE_DIR"'
+        probe = probe.replace(marker, "    false\n" + marker)
+        # Pretend a legacy install exists, without touching the real system.
+        for name, stub in (
+            ("detect_legacy() {", "detect_legacy() { return 0\n"),
+            ("make_backup() {",
+             'make_backup() { BACKUP_DIR="$(mktemp -d)"; return 0\n'),
+            ("stop_legacy() {", "stop_legacy() { return 0\n"),
+            ("migrate_cache() {", "migrate_cache() { return 0\n"),
+            ("rollback() {", 'rollback() { echo "ROLLBACK RAN"; return 0\n'),
+        ):
+            probe = probe.replace(name, stub)
+        path = os.path.join(REPO_ROOT, self.PROBE)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(probe)
+        os.chmod(path, 0o755)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return self.PROBE
+
+    def _run_probe(self, shell_options="set -Eeuo pipefail"):
+        import shutil
+        if not shutil.which("systemctl"):
+            self.skipTest("systemd is required by the installer")
+        probe = self._build_probe(shell_options)
+        result = run(["bash", probe, "--dry-run", "--skip-deps", "--force"])
+        return result, result.stdout + result.stderr
+
+    def test_failure_inside_install_files_triggers_rollback(self):
+        result, output = self._run_probe()
+        self.assertIn("ROLLBACK RAN", output,
+                      "rollback did not run:\n%s" % output)
+        self.assertNotEqual(result.returncode, 0,
+                            "a failed install must exit nonzero")
+
+    def test_errtrace_is_what_makes_that_work(self):
+        # Guards the fix itself: drop -E and the rollback becomes unreachable.
+        _, output = self._run_probe(shell_options="set -euo pipefail")
+        self.assertNotIn("ROLLBACK RAN", output,
+                         "expected the no-errtrace build to skip rollback; if "
+                         "this now passes, the rollback no longer depends on "
+                         "the ERR trap and this test can go")
+
+    def test_installer_enables_errtrace(self):
+        with open(os.path.join(REPO_ROOT, "scripts/install.sh"),
+                  encoding="utf-8") as fh:
+            self.assertIn("set -Eeuo pipefail", fh.read())
+
+
+class IdempotencyTests(unittest.TestCase):
+    def test_uninstall_twice_is_a_no_op_and_still_succeeds(self):
+        import shutil
+        if not shutil.which("systemctl"):
+            self.skipTest("systemd is required by the uninstaller")
+        first = run(["bash", "scripts/uninstall.sh", "--dry-run"])
+        second = run(["bash", "scripts/uninstall.sh", "--dry-run"])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+    def test_install_dry_run_is_repeatable(self):
+        import shutil
+        if not shutil.which("systemctl"):
+            self.skipTest("systemd is required by the installer")
+        first = run(["bash", "scripts/install.sh", "--dry-run", "--skip-deps",
+                     "--force"])
+        second = run(["bash", "scripts/install.sh", "--dry-run", "--skip-deps",
+                      "--force"])
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(second.returncode, 0)

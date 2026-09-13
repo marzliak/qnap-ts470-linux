@@ -1,11 +1,13 @@
 # Fan control (experimental, opt-in)
 
-> **Experimental.** This component is validated on exactly one machine. It
-> writes directly to your chassis fan controller and its calibration step
-> **deliberately stops the fan**. You do not need it to use the LCD.
+> **Experimental, and not yet run on hardware.** The register behaviour this
+> depends on was observed on one machine, but **this implementation has never
+> been executed on a real TS-x70**. It writes directly to your chassis fan
+> controller and its calibration step **deliberately stops the fan**.
 >
-> If you only want the display, follow [LCD_GUIDE.md](LCD_GUIDE.md) and stop
-> reading here. The default installation does not include fan control.
+> You do not need it to use the LCD. If you only want the display, follow
+> [LCD_GUIDE.md](LCD_GUIDE.md) and stop reading here. The default installation
+> does not include fan control.
 
 ---
 
@@ -22,14 +24,24 @@ hardware: `f71882fg` publishes its `pwm*` attributes under the platform device
 
 ### Status by claim
 
+Two different things get confused here, so they are kept apart. What the
+*hardware* does was observed on a real machine. What *this program* does has
+only been exercised offline.
+
 | Claim | Status |
 |---|---|
-| Reads tachometers and duty registers | Verified on the reference TS-470 Pro |
-| Drives duty from CPU temperature | Verified on the reference TS-470 Pro |
-| Restores a safe state on stop, crash and signal | Verified by unit tests and manual signalling |
-| Calibration measures usable stall/restart duties | Single-machine evidence only |
+| `fanN_input`, `pwmN` and `pwmN_enable` semantics, and the 1 = manual / 2 = automatic mode numbering | Observed on the reference TS-470 Pro, under the previous implementation |
+| That the reference unit turns channel 3 and exposes three channels | Observed on the reference TS-470 Pro |
+| **This 2.0.0 implementation, on real TS-x70 hardware** | **Not yet exercised.** Validated offline only: unit tests plus simulated-controller runs of the safe-state, temperature-loss, dead-tachometer, stall-cap and signal paths |
+| Calibration measures usable stall and restart duties on a real fan | **Unverified for this implementation.** The v1 code that this replaces did produce usable values on one fan |
 | Works on any other TS-x70 model | **Unverified** |
 | Safe for unattended use | **Not claimed** |
+
+The offline validation is real and reproducible — interrupting a simulated
+calibration with `SIGTERM`, `SIGINT`, `SIGHUP` or `SIGQUIT` leaves every
+channel at full duty in automatic mode, and a dead tachometer makes the loop
+escalate, give up and exit nonzero. What it cannot tell you is how *your* fan
+behaves when the duty actually drops.
 
 ---
 
@@ -44,10 +56,12 @@ Read these before deciding to use it.
 2. **Single-machine calibration.** The stall and restart duties are measured on
    your fan, which is good, but the measurement procedure itself has only been
    exercised on one machine and one fan.
-3. **The duty floor is a safety bias, not a measurement.** The program never
-   commands a duty below `PWM_FLOOR` (64) while a fan is meant to be turning,
-   even if calibration measured a lower stall point. A fan parked at its own
-   stall threshold has no margin for dust, wear or a warm day.
+3. **The duty floor is a safety bias, not a measurement.** During normal
+   operation the program never commands a duty below `PWM_FLOOR` (64), even if
+   calibration measured a lower stall point: a fan parked at its own stall
+   threshold has no margin for dust, wear or a warm day. Calibration itself is
+   the exception — it has to go below the floor and to zero to find where the
+   fan stops, which is the whole hazard described in [§6](#6-calibration-hazard).
 4. **The chip's own automatic mode is the fallback, not a guarantee.** Every
    failure path hands the fan back to `pwm*_enable = 2`. What that mode does is
    a property of your board's firmware, not of this program.
@@ -126,8 +140,9 @@ not need root. Run this first, always.
 qnap-tsx70-fancontrol calibrate --yes
 ```
 
-See [§6](#6-calibration-hazard) before running it. Without `--yes` the command
-prints the hazard notice and exits with status 2 without touching anything.
+See [§6](#6-calibration-hazard) before running it. Run it as root: without
+`--yes` it prints the hazard notice and exits with status 2 without touching
+anything, and without root it refuses before reaching that point.
 
 | Flag | Effect |
 |---|---|
@@ -157,6 +172,15 @@ Forces every controllable channel to full duty and then back to the chip's
 automatic mode. Run this if anything ever leaves your fan in a state you do not
 like. It is also wired as `ExecStopPost=` on the service, so a `SIGKILL` or an
 OOM kill still ends with the chip in charge.
+
+Unlike `run` and `calibrate`, this command deliberately does **not** take the
+lock, so it always works as an emergency recovery. That means it can fight a
+running control loop over the same registers — stop the service first unless
+this genuinely is a recovery:
+
+```bash
+sudo systemctl stop qnap-tsx70-fancontrol
+```
 
 ---
 

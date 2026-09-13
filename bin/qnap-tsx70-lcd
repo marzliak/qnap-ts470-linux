@@ -27,7 +27,6 @@ import time
 VERSION = "2.0.0"
 
 DEFAULT_CONFIG_PATH = "/etc/qnap-tsx70-lcd.conf"
-STATE_DIR = "/var/lib/qnap-tsx70"
 
 # --------------------------------------------------------------------------
 # Protocol layer - pure functions, no I/O, no system state.
@@ -775,6 +774,41 @@ def detail_pages(disk):
 # Device layer
 # --------------------------------------------------------------------------
 
+class LcdError(RuntimeError):
+    """The panel could not be opened. Carries an actionable message."""
+
+
+def open_device(conf):
+    """Open the panel, turning the usual failures into advice.
+
+    A bare OSError traceback here is the first thing a new user would see, on
+    the very step the README tells them to run first.
+    """
+    import termios  # for termios.error, which is not an OSError subclass
+
+    port = conf["serial_port"]
+    try:
+        return LcdDevice(port, conf["write_delay"])
+    except termios.error as exc:
+        raise LcdError(
+            "%s is not a serial port (%s). The panel is on a UART such as "
+            "/dev/ttyS1; run 'qnap-tsx70-lcd --check'." % (port, exc))
+    except IsADirectoryError:
+        raise LcdError("%s is a directory, not a serial port." % port)
+    except FileNotFoundError:
+        raise LcdError(
+            "serial port %s does not exist. Run 'qnap-tsx70-lcd --check' to "
+            "see what this machine exposes, and --port to try another." % port)
+    except PermissionError:
+        raise LcdError(
+            "permission denied opening %s. This needs root; try sudo." % port)
+    except OSError as exc:
+        raise LcdError(
+            "cannot open %s: %s. Run 'qnap-tsx70-lcd --check', and check "
+            "nothing else holds the port (fuser -v %s)."
+            % (port, exc.strerror or exc, port))
+
+
 class LcdDevice:
     """Serial transport. The only component that touches the hardware."""
 
@@ -988,7 +1022,7 @@ def preflight(conf, verbose=True, config_path=None):
 
 def run(conf):
     monitor = Monitor(conf)
-    device = LcdDevice(conf["serial_port"], conf["write_delay"])
+    device = open_device(conf)
     page_interval = conf["page_interval"]
     detail_timeout = conf["detail_timeout"]
     screen_timeout = conf["screen_timeout"]
@@ -1160,7 +1194,7 @@ def main(argv=None):
 
     if args.test_message is not None:
         line1, _, line2 = args.test_message.partition("|")
-        device = LcdDevice(conf["serial_port"], conf["write_delay"])
+        device = open_device(conf)
         try:
             device.backlight(True)
             device.write_lines(line1, line2)
@@ -1170,8 +1204,12 @@ def main(argv=None):
         return 0
 
     if args.clear:
-        device = LcdDevice(conf["serial_port"], conf["write_delay"])
+        device = open_device(conf)
         try:
+            # Send the documented clear command, then blank both rows as well:
+            # the rows are what actually guarantees a blank panel if a given
+            # unit ignores the clear opcode.
+            device.clear()
             device.write_lines("", "")
             device.backlight(False)
         finally:
@@ -1183,7 +1221,7 @@ def main(argv=None):
         monitor.refresh_disks()
         monitor.refresh()
         line1, line2 = monitor.render(0)
-        device = LcdDevice(conf["serial_port"], conf["write_delay"])
+        device = open_device(conf)
         try:
             device.backlight(True)
             device.write_lines(line1, line2)
@@ -1199,5 +1237,14 @@ def main(argv=None):
     return 0
 
 
+def cli(argv=None):
+    """Entry point wrapper that turns LcdError into a one-line message."""
+    try:
+        return main(argv)
+    except LcdError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())

@@ -33,11 +33,14 @@ NAS model, so it is the feature most likely to work anywhere.
 
 ## 2. Why "Pro" matters more than the model number
 
-The `Pro` suffix is not cosmetic. Published specifications place the Pro tower
-models on **Ivy Bridge** (Intel Core i3-3220) and the non-Pro models of the same
-number on an earlier **Sandy Bridge** Celeron. That is a different CPU
-generation, which usually means a different board revision, and potentially a
-different Super I/O chip and a different front-panel arrangement.
+The `Pro` suffix is not cosmetic. QNAP's own specification places the Pro tower
+models on **Ivy Bridge** (Intel Core i3-3220). The non-Pro models of the same
+number are *reported* to ship an earlier **Sandy Bridge** Celeron — that
+attribution comes from retailer listings and a review rather than from a QNAP
+specification page retrieved for this document, so treat it as indicative
+rather than established. If it holds, it is a different CPU generation, which
+usually means a different board revision, and potentially a different Super I/O
+chip and a different front-panel arrangement.
 
 So `TS-470` and `TS-470 Pro` are less alike than the names suggest. Do not
 assume that testing on one tells you anything definitive about the other.

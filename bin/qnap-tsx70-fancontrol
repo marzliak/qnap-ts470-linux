@@ -70,6 +70,11 @@ TEMP_FAILURE_LIMIT = 3  # consecutive bad temperature reads before failing safe
 WRITE_FAILURE_LIMIT = 3 # consecutive failed register writes before failing safe
 KICKSTART_LIMIT = 6     # consecutive failed kickstarts before giving up
 
+# Lowest duty the descending sweep will command. Deliberately below PWM_FLOOR:
+# the point of the sweep is to find where this particular fan stops, which may
+# be below the duty the control loop is willing to use afterwards.
+CALIBRATION_SWEEP_MIN = 55
+
 # Calibration guards.
 CALIBRATION_START_MAX_TEMP = 60  # refuse to begin above this
 CALIBRATION_ABORT_TEMP = 70      # abort mid-sweep at or above this
@@ -699,7 +704,7 @@ def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
 
     log("  searching stall duty (the fan will stop)...")
     last_spinning = PWM_MAX
-    for duty in range(120, PWM_FLOOR - 6, -5):
+    for duty in range(120, CALIBRATION_SWEEP_MIN - 1, -5):
         controller.set_pwm(channel, duty)
         _settle(controller, channel, settle, temp_path)
         rpm = controller.rpm(channel)
@@ -711,10 +716,10 @@ def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
             log("    duty %3d: STALLED" % duty)
             break
     if result["stall_duty"] is None:
-        # Still turning at the lowest duty we are willing to command.
+        # The fan never stopped anywhere in the swept range.
         result["stall_duty"] = last_spinning
-        log("  still spinning at the duty floor (%d); using it as the minimum"
-            % PWM_FLOOR)
+        log("  never stalled; lowest duty tried was %d and it kept turning"
+            % last_spinning)
     result["minstop"] = max(PWM_FLOOR, clamp_pwm(last_spinning + 10))
     log("  lowest spinning duty %d -> minimum %d with margin"
         % (last_spinning, result["minstop"]))

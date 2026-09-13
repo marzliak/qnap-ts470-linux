@@ -499,3 +499,39 @@ class RowWidthTests(unittest.TestCase):
         for name in ("sda", "nvme0n1", "mmcblk0"):
             header = "[%s] %d/%d" % (name, 5, 5)
             self.assertLessEqual(len(header), 16, header)
+
+
+class DeviceOpenErrorTests(unittest.TestCase):
+    """A wrong port is the likeliest beginner mistake and the first documented
+    step; it must produce advice rather than a traceback."""
+
+    def _error_for(self, port):
+        conf = dict(lcd.DEFAULTS, serial_port=port)
+        with self.assertRaises(lcd.LcdError) as ctx:
+            lcd.open_device(conf)
+        return str(ctx.exception)
+
+    def test_missing_port(self):
+        message = self._error_for("/dev/definitely-not-here")
+        self.assertIn("does not exist", message)
+        self.assertIn("--check", message)
+
+    def test_directory_instead_of_port(self):
+        self.assertIn("directory", self._error_for(tempfile.gettempdir()))
+
+    def test_regular_file_instead_of_port(self):
+        with tempfile.NamedTemporaryFile(suffix=".notatty") as handle:
+            message = self._error_for(handle.name)
+        self.assertIn("not a serial port", message)
+        self.assertIn("--check", message)
+
+    def test_cli_reports_the_error_without_a_traceback(self):
+        import contextlib
+        import io
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = lcd.cli(["--port", "/dev/definitely-not-here",
+                            "--config", "/nonexistent", "--once"])
+        self.assertEqual(code, 1)
+        self.assertTrue(stderr.getvalue().startswith("error: "))
+        self.assertNotIn("Traceback", stderr.getvalue())

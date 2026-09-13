@@ -217,21 +217,45 @@ class MarkdownLinkTests(unittest.TestCase):
                     insecure.append("%s -> %s" % (path, target))
         self.assertEqual(insecure, [])
 
+    @staticmethod
+    def _slugs(body):
+        found = set()
+        for line in body.splitlines():
+            if line.startswith("#"):
+                title = line.lstrip("#").strip().lower()
+                found.add(re.sub(r"[^a-z0-9 -]", "", title).replace(" ", "-"))
+        return found
+
     def test_anchor_links_point_at_a_real_heading(self):
+        """Covers cross-file fragments too, not just same-file ones.
+
+        A same-file-only check missed LCD_PROTOCOL.md pointing at
+        LCD_GUIDE.md#6-configuration, where section 6 is "Installing".
+        """
         broken = []
+        cache = {}
         for path, body in text_files():
             if not path.endswith(".md"):
                 continue
-            slugs = set()
-            for line in body.splitlines():
-                if line.startswith("#"):
-                    title = line.lstrip("#").strip().lower()
-                    slug = re.sub(r"[^a-z0-9 -]", "", title).replace(" ", "-")
-                    slugs.add(slug)
+            base = os.path.dirname(os.path.join(REPO_ROOT, path))
             for target in self.LINK.findall(body):
-                if not target.startswith("#"):
+                if target.startswith(("http://", "https://", "mailto:")):
                     continue
-                if target[1:] not in slugs:
+                file_part, _, fragment = target.partition("#")
+                if not fragment:
+                    continue
+                if not file_part:
+                    slugs = self._slugs(body)
+                else:
+                    resolved = os.path.normpath(os.path.join(base, file_part))
+                    if not os.path.isfile(resolved):
+                        continue  # reported by the relative-link test
+                    if resolved not in cache:
+                        with open(resolved, encoding="utf-8",
+                                  errors="replace") as handle:
+                            cache[resolved] = self._slugs(handle.read())
+                    slugs = cache[resolved]
+                if fragment not in slugs:
                     broken.append("%s -> %s" % (path, target))
         self.assertEqual(broken, [], "broken anchors: %s" % broken)
 

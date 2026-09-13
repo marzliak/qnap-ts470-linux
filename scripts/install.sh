@@ -9,7 +9,10 @@
 # configuration content is generated here, so the repository is the only source
 # of truth.
 
-set -euo pipefail
+# -E (errtrace) matters: without it bash does not inherit the ERR trap
+# into shell functions, so a failure inside install_files() or
+# enable_services() would abort without ever running rollback().
+set -Eeuo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)"
 
@@ -418,6 +421,10 @@ main() {
         legacy=1
         step "Migrating legacy saturn-* installation"
         make_backup
+        # Armed as soon as a backup exists: stopping the legacy services is
+        # already a change worth undoing if what follows fails.
+        trap 'on_error $?' ERR
+        ROLLBACK_NEEDED=1
         stop_legacy
         migrate_cache
     fi

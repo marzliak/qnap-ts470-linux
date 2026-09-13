@@ -2,6 +2,10 @@
 Description=QNAP TS-x70 chassis fan control (experimental)
 Documentation=https://github.com/marzliak/qnap-ts470-linux/blob/main/docs/FAN_CONTROL.md
 After=local-fs.target
+# Modules are loaded from /etc/modules-load.d rather than by this unit,
+# so wait for that to finish; otherwise a cold boot can start the
+# service before f71882fg has bound and burn a start attempt.
+After=systemd-modules-load.service
 # Failing repeatedly means the machine cannot control its fans. Give up
 # rather than hiding the condition behind an endless restart loop; the
 # chip's own automatic mode is left in charge by the safe-state handler.

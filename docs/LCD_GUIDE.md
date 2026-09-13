@@ -102,19 +102,26 @@ fans. The default installation does not install fan control, and this guide
 never asks you to. If you want it later, read
 [FAN_CONTROL.md](FAN_CONTROL.md) — its calibration deliberately stops the fan.
 
-**What gets modified.** An LCD-only install writes to exactly four places:
+**What gets modified.** An LCD-only install touches these places and no
+others:
 
 | Path | Change |
 |---|---|
 | `/usr/local/bin/qnap-tsx70-lcd` | new file |
 | `/etc/qnap-tsx70-lcd.conf` | created only if absent; an existing file is never overwritten |
 | `/etc/systemd/system/qnap-tsx70-lcd.service` | new file |
+| `/etc/systemd/system/multi-user.target.wants/` | symlink created by `systemctl enable` |
 | `/var/lib/qnap-tsx70/` | created, empty for an LCD-only install |
+| your package manager | `apt-get install smartmontools util-linux` if either is missing — skip with `--skip-deps` |
 
-Nothing else is touched. If an installation from before version 2.0.0 is
-found, it is backed up to `/var/backups/qnap-tsx70/<timestamp>/` before
-anything changes; see
+If an installation from before version 2.0.0 is found, it is backed up to
+`/var/backups/qnap-tsx70/<timestamp>/` before anything changes; see
 [MIGRATION_FROM_SATURN.md](MIGRATION_FROM_SATURN.md).
+
+`--with-fan-control` additionally writes `/usr/local/bin/qnap-tsx70-fancontrol`,
+`/etc/systemd/system/qnap-tsx70-fancontrol.service` and
+`/etc/modules-load.d/qnap-tsx70.conf`, and loads the `f71882fg` and `coretemp`
+modules.
 
 Preview the whole thing without changing anything:
 

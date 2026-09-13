@@ -5,6 +5,11 @@ Documentation=https://github.com/marzliak/qnap-ts470-linux/blob/main/docs/LCD_GU
 # unit is itself part of multi-user.target, so ordering after it would be
 # circular in intent even though systemd tolerates it.
 After=local-fs.target
+# A port that is permanently missing or held by something else would
+# otherwise restart every 5 s forever without tripping systemd's
+# default burst limit. Give up and stay visible as a failed unit.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 # Deliberately independent of qnap-tsx70-fancontrol: the display does not need
 # fan control, and fan control is optional and experimental.
 

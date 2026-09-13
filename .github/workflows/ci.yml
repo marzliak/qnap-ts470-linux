@@ -13,11 +13,17 @@ jobs:
   python:
     name: Python compile and tests
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the supported range, so the version claim in the README
+        # is actually tested rather than asserted.
+        python-version: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "${{ matrix.python-version }}"
 
       - name: Byte-compile every Python executable
         run: python3 -m py_compile bin/qnap-tsx70-lcd bin/qnap-tsx70-fancontrol
@@ -60,14 +66,18 @@ jobs:
       - name: Validate unit files without installing them
         run: |
           set -eu
-          # systemd-analyze verify reports a missing ExecStart binary because
-          # nothing is installed on the runner; that one message is expected.
-          # Any other complaint is a real syntax or key error.
+          # systemd-analyze also reports problems in unrelated units it loads
+          # from the system search path, so the filter is scoped to ours first.
+          # The missing ExecStart binary is expected: nothing is installed on
+          # the runner. Any other complaint about our units is a real error.
           output="$(systemd-analyze verify systemd/*.service 2>&1 || true)"
           echo "$output"
-          filtered="$(echo "$output" | grep -v 'is not executable' || true)"
+          filtered="$(echo "$output" \
+            | grep -E 'qnap-tsx70-(lcd|fancontrol)\.service' \
+            | grep -v 'is not executable' || true)"
           if [ -n "$filtered" ]; then
-            echo "::error::systemd-analyze reported unexpected problems"
+            echo "::error::systemd-analyze reported problems in this repo's units"
+            echo "$filtered"
             exit 1
           fi
 
