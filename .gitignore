@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+
+# Scratch file written by tests/test_scripts.py; removed on cleanup.
+scripts/.install-rollback-probe.sh

@@ -399,8 +399,10 @@ class DocumentedConstantTests(unittest.TestCase):
         self.assertLess(fan.CALIBRATION_SWEEP_MIN, fan.PWM_FLOOR,
                         "the sweep must go below the duty floor to find a stall")
         # And the documentation must acknowledge that it does.
-        doc = read("docs/FAN_CONTROL.md")
-        self.assertIn("Calibration itself is\n   the exception", doc,
+        # Matched on a phrase rather than an exact line, so reflowing the
+        # paragraph does not break the test.
+        doc = " ".join(read("docs/FAN_CONTROL.md").split())
+        self.assertIn("Calibration itself is the exception", doc,
                       "FAN_CONTROL.md no longer notes that calibration goes "
                       "below the duty floor")
 
@@ -408,6 +410,24 @@ class DocumentedConstantTests(unittest.TestCase):
         fan = load_fan()
         self.assertIn("up to %2d seconds" % fan.CALIBRATION_MAX_STALL_S,
                       fan.CALIBRATION_WARNING)
+
+    def test_lcd_start_limit_matches_the_guide(self):
+        """The guide's restart-loop advice has to track the unit.
+
+        It previously said the service "will keep trying" after the unit gained
+        a start limit that makes it stop and stay failed.
+        """
+        unit = read("systemd/qnap-tsx70-lcd.service")
+        guide = read("docs/LCD_GUIDE.md")
+        for key in ("StartLimitBurst", "StartLimitIntervalSec"):
+            match = re.search(r"^%s=(\d+)" % key, unit, re.MULTILINE)
+            self.assertIsNotNone(match, "%s is no longer set on the LCD unit" % key)
+            self.assertIn("`%s=%s`" % (key, match.group(1)), guide,
+                          "docs/LCD_GUIDE.md does not state %s=%s"
+                          % (key, match.group(1)))
+        self.assertIn("systemctl reset-failed qnap-tsx70-lcd", guide,
+                      "the guide does not say how to recover from the failed "
+                      "state the start limit produces")
 
     def test_lcd_timing_floor_matches_the_guide(self):
         lcd = load_lcd()

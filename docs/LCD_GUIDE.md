@@ -713,8 +713,18 @@ journalctl -u qnap-tsx70-lcd -n 100
 ```
 
 The usual causes are a serial port that disappeared, a port held by another
-process, or a permissions change. `Restart=always` with `RestartSec=5` means it
-will keep trying; the log says why.
+process, or a permissions change. The log says which.
+
+`Restart=always` with `RestartSec=5` retries every five seconds, but the unit
+also sets `StartLimitBurst=10` over `StartLimitIntervalSec=300`: after ten
+starts in five minutes systemd gives up and leaves the unit `failed`, rather
+than retrying a permanently broken configuration forever. Once you have fixed
+the cause, clear that state before starting it again:
+
+```bash
+sudo systemctl reset-failed qnap-tsx70-lcd
+sudo systemctl start qnap-tsx70-lcd
+```
 
 ### Temperatures show N/A
 

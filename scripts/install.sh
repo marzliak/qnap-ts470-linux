@@ -297,6 +297,10 @@ remove_legacy() {
 rollback() {
     [ "$ROLLBACK_NEEDED" -eq 1 ] || return 0
     [ -n "$BACKUP_DIR" ] || return 0
+    # Best effort from here: this runs while something has already gone wrong,
+    # so one failed restore must not stop the remaining ones. Under `set -e` a
+    # single failing cp would abandon the rest of the rollback half done.
+    set +e
     warn "rolling back to the previous installation"
     local unit
     for unit in "${LEGACY_UNITS[@]}"; do
@@ -322,6 +326,8 @@ rollback() {
         done < "$BACKUP_DIR/enabled-units"
     fi
     warn "rollback complete; originals remain in $BACKUP_DIR"
+    set -e
+    return 0
 }
 
 on_error() {
