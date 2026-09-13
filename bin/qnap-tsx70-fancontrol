@@ -804,15 +804,19 @@ def cmd_calibrate(args):
         return 0
 
     results = {}
+    outcome = "aborted"
     try:
         for channel in channels:
             results[channel] = calibrate_channel(controller, channel, temp_path)
+        outcome = "finished"
     except Terminated as exc:
+        outcome = "interrupted by %s" % exc
         raise FanError("calibration interrupted by %s before completion" % exc)
     finally:
         # Runs on success too: a sweep that visited stall duties must never
-        # leave the chip in manual mode.
-        controller.safe_state(reason="calibration finished")
+        # leave the chip in manual mode. The reason is reported accurately so
+        # the journal does not claim a clean finish after an interruption.
+        controller.safe_state(reason="calibration %s" % outcome)
         lock.close()
 
     usable, rejected = {}, []
