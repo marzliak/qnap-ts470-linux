@@ -111,6 +111,7 @@ automatically — see [docs/MIGRATION_FROM_SATURN.md](docs/MIGRATION_FROM_SATURN
 - An offline test suite — 233 tests, no hardware required.
 - GitHub Actions CI: Python compilation and tests, `bash -n` and ShellCheck,
   `systemd-analyze verify`, and static documentation and privacy checks.
+  Staged at `ci/github-actions/ci.yml` pending activation; see `ci/README.md`.
 - An MIT `LICENSE`.
 
 ### Documentation

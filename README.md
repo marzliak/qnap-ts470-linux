@@ -9,6 +9,12 @@ working the moment you install your own OS.
 
 [![CI](https://github.com/marzliak/qnap-ts470-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/marzliak/qnap-ts470-linux/actions/workflows/ci.yml)
 
+> The badge will not resolve until the workflow is activated. It is staged at
+> [`ci/github-actions/ci.yml`](ci/README.md) rather than `.github/workflows/`,
+> because the credential used to open the pull request lacked GitHub's
+> `workflow` scope. `ci/README.md` has the one command that moves it, and every
+> check it runs so you can run them by hand meanwhile.
+
 ---
 
 ## ⚠️ Tested on exactly one machine
