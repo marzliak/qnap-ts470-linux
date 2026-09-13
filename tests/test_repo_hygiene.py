@@ -45,6 +45,8 @@ LEGACY_ALLOWED = {
     "tests/fixtures.py",              # builds legacy installations to test on
     "tests/test_install_safety.py",   # exercises the migration
     "tests/test_docs_rollback.py",    # executes the documented rollback
+    "tests/test_lifecycle_lock.py",   # exercises the migration lock path
+    "tests/test_rollback_scope.py",   # exercises legacy rollback scope
 }
 
 # A link to the migration document is not itself a legacy reference.
