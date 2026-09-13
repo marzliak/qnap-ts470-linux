@@ -165,3 +165,27 @@ class ConfigProblemTests(unittest.TestCase):
         path = os.path.join(REPO_ROOT, "config/qnap-tsx70-lcd.conf.example")
         with open(path, encoding="utf-8") as handle:
             self.assertEqual(lcd.config_problems(handle.read()), [])
+
+
+class DateFormatTests(unittest.TestCase):
+    """The date shares a 16-column row; a format that overflows loses digits."""
+
+    def test_default_format_fits_the_panel(self):
+        import time
+        rendered = time.strftime(lcd.DEFAULTS["date_format"])
+        self.assertLessEqual(len(rendered), lcd.LCD_COLS,
+                             "default date_format renders %r (%d chars)"
+                             % (rendered, len(rendered)))
+
+    def test_default_format_is_locale_independent(self):
+        # %b and %a expand differently per locale and can overflow the row.
+        self.assertNotIn("%b", lcd.DEFAULTS["date_format"])
+        self.assertNotIn("%a", lcd.DEFAULTS["date_format"])
+
+    def test_cpuload_page_row_two_fits(self):
+        import time
+        snapshot = {"cpu_pct": 100,
+                    "datetime": time.strftime(lcd.DEFAULTS["date_format"])}
+        line1, line2 = lcd.page_cpuload(snapshot)
+        self.assertEqual(lcd.pad_line(line2).rstrip(b" ").decode(),
+                         snapshot["datetime"])

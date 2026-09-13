@@ -78,5 +78,8 @@ smart_enabled = true
 #   temps    CPU and board temperature / NIC temperature
 pages = host,cpu,uptime,cpuload,fan,net,temps
 
-# strftime format for the date on the cpuload page. Must fit 16 characters.
-date_format = %H:%M %d/%b/%Y
+# strftime format for the date on the cpuload page. Must fit 16 characters;
+# anything longer is truncated. The default is exactly 16 and uses only
+# numeric fields, so it does not grow in other locales the way %b can.
+# Check yours with: qnap-tsx70-lcd --check
+date_format = %H:%M %d/%m/%Y

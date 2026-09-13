@@ -145,7 +145,7 @@ DEFAULTS = {
     "fan_device_glob": "/sys/devices/platform/f71882fg.*",
     "smart_enabled": True,
     "pages": "host,cpu,uptime,cpuload,fan,net,temps",
-    "date_format": "%H:%M %d/%b/%Y",
+    "date_format": "%H:%M %d/%m/%Y",
 }
 
 BOOL_TRUE = ("1", "true", "yes", "on")
