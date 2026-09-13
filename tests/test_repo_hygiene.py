@@ -317,3 +317,87 @@ class DocumentedInterfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DocumentedConstantTests(unittest.TestCase):
+    """Safety numbers in the docs must match the code that enforces them.
+
+    A guide promising a 60 C limit while the code uses another value is worse
+    than no guide: the reader plans around a guarantee that does not exist.
+    """
+
+    def test_fan_safety_constants_match_the_documentation(self):
+        fan = load_fan()
+        doc = read("docs/FAN_CONTROL.md")
+        expectations = [
+            ("calibration start limit", fan.CALIBRATION_START_MAX_TEMP,
+             r"above (\d+)\s*°C"),
+            ("calibration abort temperature", fan.CALIBRATION_ABORT_TEMP,
+             r"at (\d+) °C during the sweep"),
+            ("maximum stall time", fan.CALIBRATION_MAX_STALL_S,
+             r"longer than (\d+) s"),
+            ("duty floor", fan.PWM_FLOOR, r"`PWM_FLOOR` \((\d+)\)"),
+            ("temperature failure limit", fan.TEMP_FAILURE_LIMIT,
+             r"after (\d+) consecutive cycles"),
+            ("write failure limit", fan.WRITE_FAILURE_LIMIT,
+             r"(\d+) consecutive register write failures"),
+            ("kickstart limit", fan.KICKSTART_LIMIT, r"after (\d+), exit nonzero"),
+            ("curve lower bound", fan.TEMP_MIN, r"default (\d+) °C\) the fan runs"),
+            ("curve upper bound", fan.TEMP_MAX, r"default (\d+) °C\) at full duty"),
+        ]
+        for label, value, pattern in expectations:
+            with self.subTest(constant=label):
+                match = re.search(pattern, doc)
+                self.assertIsNotNone(
+                    match, "docs/FAN_CONTROL.md no longer states the %s" % label)
+                self.assertEqual(match.group(1), str(value),
+                                 "%s: code says %s, documentation says %s"
+                                 % (label, value, match.group(1)))
+
+    def test_calibration_warning_quotes_the_real_stall_cap(self):
+        fan = load_fan()
+        self.assertIn("up to %2d seconds" % fan.CALIBRATION_MAX_STALL_S,
+                      fan.CALIBRATION_WARNING)
+
+    def test_lcd_timing_floor_matches_the_guide(self):
+        lcd = load_lcd()
+        guide = read("docs/LCD_GUIDE.md")
+        for pattern in (r"minimum of ([0-9.]+) s",
+                        r"\*\*Clamped to a minimum of ([0-9.]+)\*\*"):
+            match = re.search(pattern, guide)
+            self.assertIsNotNone(match, pattern)
+            self.assertEqual(float(match.group(1)), lcd.MIN_WRITE_DELAY)
+
+    def test_protocol_document_matches_the_command_bytes(self):
+        lcd = load_lcd()
+        protocol = read("docs/LCD_PROTOCOL.md")
+        for label, frame in (
+                ("Backlight on", lcd.frame_backlight(True)),
+                ("Backlight off", lcd.frame_backlight(False)),
+                ("Clear", lcd.frame_clear()),
+                ("Stop built-in clock", lcd.frame_stop_clock()),
+        ):
+            rendered = " ".join("%02X" % b for b in frame)
+            self.assertIn("`%s`" % rendered, protocol,
+                          "%s is documented as something other than %s"
+                          % (label, rendered))
+
+    def test_protocol_document_matches_the_row_write_headers(self):
+        lcd = load_lcd()
+        protocol = read("docs/LCD_PROTOCOL.md")
+        for row in (0, 1):
+            header = " ".join("%02X" % b for b in lcd.frame_line(row, "")[:4])
+            self.assertIn("`%s`" % header, protocol, header)
+
+    def test_protocol_document_matches_the_button_prefix(self):
+        lcd = load_lcd()
+        protocol = read("docs/LCD_PROTOCOL.md")
+        prefix = " ".join("0x%02x" % b for b in lcd.BUTTON_PREFIX)
+        self.assertIn(prefix, protocol, prefix)
+
+    def test_page_names_in_the_guide_exist(self):
+        lcd = load_lcd()
+        guide = read("docs/LCD_GUIDE.md")
+        for name in lcd.PAGES:
+            self.assertIn("`%s`" % name, guide,
+                          "page %r is not documented in the guide" % name)
