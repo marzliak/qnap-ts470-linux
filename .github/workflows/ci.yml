@@ -39,6 +39,13 @@ jobs:
             bash -n "$script"
           done
 
+      # Exercises the installer, uninstaller and diagnostics in dry-run mode.
+      # Syntax checks cannot catch an abort caused by set -o pipefail.
+      - name: Script behaviour (dry run)
+        run: python3 -m unittest tests.test_scripts -v
+        env:
+          PYTHONPATH: tests
+
       # Pre-installed on ubuntu-latest runners. This is the only place
       # ShellCheck runs: it is not available in every local environment.
       - name: ShellCheck

@@ -110,7 +110,10 @@ collect() {
     section "Serial ports"
     ls -l /dev/ttyS* 2>/dev/null || printf 'no /dev/ttyS* devices\n'
     local port
-    port="$(sed -n 's/^[[:space:]]*serial_port[[:space:]]*=[[:space:]]*//p' "$CONF_FILE" 2>/dev/null | tail -1)"
+    port=""
+    if [ -r "$CONF_FILE" ]; then
+        port="$(sed -n 's/^[[:space:]]*serial_port[[:space:]]*=[[:space:]]*//p' "$CONF_FILE" | tail -1)" || port=""
+    fi
     port="${port:-/dev/ttyS1}"
     printf '\nconfigured port: %s\n' "$port"
     if [ -c "$port" ]; then

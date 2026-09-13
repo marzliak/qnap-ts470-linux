@@ -149,9 +149,13 @@ preflight() {
         failed=1
     fi
 
-    local port
-    port="$(sed -n 's/^[[:space:]]*serial_port[[:space:]]*=[[:space:]]*//p' \
-            "$CONF_FILE" 2>/dev/null | tail -1)"
+    # sed exits 2 when the file is absent, and pipefail would turn that into a
+    # silent abort of the whole installer on a first-time install.
+    local port=""
+    if [ -r "$CONF_FILE" ]; then
+        port="$(sed -n 's/^[[:space:]]*serial_port[[:space:]]*=[[:space:]]*//p' \
+                "$CONF_FILE" | tail -1)" || port=""
+    fi
     port="${port:-/dev/ttyS1}"
     if [ -c "$port" ]; then
         ok "serial port $port present"
@@ -364,12 +368,12 @@ install_files() {
 enable_services() {
     step "Enabling services"
     run systemctl daemon-reload
-    run systemctl enable qnap-tsx70-lcd.service >/dev/null
+    run systemctl enable qnap-tsx70-lcd.service
     run systemctl restart qnap-tsx70-lcd.service
     ok "qnap-tsx70-lcd enabled and started"
 
     if [ "$WITH_FAN" -eq 1 ]; then
-        run systemctl enable qnap-tsx70-fancontrol.service >/dev/null
+        run systemctl enable qnap-tsx70-fancontrol.service
         # Not started here: 'run' requires a calibration that only the operator
         # may trigger, because calibration deliberately stalls the fan.
         ok "qnap-tsx70-fancontrol enabled but NOT started"
