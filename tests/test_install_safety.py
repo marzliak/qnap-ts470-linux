@@ -277,6 +277,26 @@ class LegacyPidTests(InstallerCase):
         self.assertNothingRemoved(result)
         self.assertEqual(self.fixture.kill_calls(), [])
 
+    def test_a_legacy_daemon_under_a_versioned_interpreter_is_recognised(self):
+        # /proc/<pid>/exe of a `#!/usr/bin/env python3` script resolves to
+        # python3.13. Matching interpreter names exactly made the installer
+        # call its own legacy daemon a reused PID and refuse to migrate.
+        # A unit written as `ExecStart=/usr/bin/python3.13 /usr/local/bin/...`
+        # reports the version in comm as well as in exe, so neither name
+        # matches an exact-match interpreter list.
+        self._legacy_with_pid()
+        self.fixture.add_process(
+            4242, "python3.13", exe=self.fixture.python_stub_versioned,
+            argv=["/usr/bin/python3.13", "/usr/local/bin/saturn-fancontrol",
+                  "--run"])
+
+        result = self.fixture.install("--skip-deps")
+
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + "\n" + result.stderr)
+        self.assertIn("-TERM 4242", " ".join(self.fixture.kill_calls()))
+        self.assertNotIn("reused", result.stderr)
+
     def test_a_process_that_ignores_sigterm_aborts_instead_of_being_killed(self):
         self._legacy_with_pid()
         self.fixture.add_process(4242, "saturn-fancontrol",
@@ -326,6 +346,11 @@ class DryRunTests(InstallerCase):
         self.assertNotEqual(result.returncode, 0,
                             "the injected failure did not fail the run")
         self.assertIn("rolling back", result.stderr)
+        # The report-only path has to be the one that ran. Without this the
+        # test also passes when rollback falls through to the real restore
+        # and is stopped only by the manifest that a dry run never writes.
+        self.assertIn("[dry-run] rollback would restore", result.stdout)
+        self.assertIn("[dry-run]   path", result.stdout)
         self.assertEqual(self.fixture.snapshot(), before,
                          "a dry-run rollback modified the fake root")
         self.assertEqual(self.fixture.mutating_calls(), [])

@@ -255,6 +255,12 @@ class ShellFixture:
         # interpreter as /proc/<pid>/exe. Kept outside the fake root so it is
         # not part of any snapshot.
         self.python_stub = os.path.join(self.harness, "usr/bin/python3")
+        # What /proc/<pid>/exe actually resolves to for a `#!/usr/bin/env
+        # python3` service. The scenarios below use this one, so the identity
+        # checks are exercised against a versioned name by default rather than
+        # against the convenient one.
+        self.python_stub_versioned = os.path.join(self.harness,
+                                                  "usr/bin/python3.13")
 
         for path in (self.bin_dir, self.unit_dir, self.run_dir, self.dev_dir,
                      os.path.join(self.root, "etc"), self.proc_dir,
@@ -265,7 +271,8 @@ class ShellFixture:
                      os.path.join(self.fake_state, "inert"),
                      os.path.dirname(self.python_stub)):
             os.makedirs(path, exist_ok=True)
-        self._write_exec(self.python_stub, "#!/bin/sh\nexit 0\n")
+        for stub in (self.python_stub, self.python_stub_versioned):
+            self._write_exec(stub, "#!/bin/sh\nexit 0\n")
 
         for name, body in (("systemctl", FAKE_SYSTEMCTL), ("fuser", FAKE_FUSER),
                            ("modprobe", FAKE_MODPROBE)):
@@ -477,7 +484,7 @@ class ShellFixture:
             self.write(self.legacy_cache, cache)
         if lcd_active:
             self.add_process(4101, "python3",
-                             exe=self.python_stub,
+                             exe=self.python_stub_versioned,
                              argv=["python3", os.path.join(self.bin_dir, "saturn-lcd")])
             self.hold_port(4101, unit="saturn-lcd.service")
         return self
@@ -490,7 +497,7 @@ class ShellFixture:
                       mainpid=5201, procs=[5201])
         if active:
             self.add_process(5201, "python3",
-                             exe=self.python_stub,
+                             exe=self.python_stub_versioned,
                              argv=["python3",
                                    os.path.join(self.bin_dir, "qnap-tsx70-lcd")])
             self.hold_port(5201, unit="qnap-tsx70-lcd.service")

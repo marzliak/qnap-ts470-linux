@@ -74,12 +74,13 @@ reinstall, rollback and diagnostic paths before it does.
 
 ### Testing
 
-The suite is now **330 tests**, up from 234. The new ones execute the failure
+The suite is now **331 tests**, up from 234. The new ones execute the failure
 paths rather than searching the source for strings: stop failures, PID
 identity, dry-run non-mutation proved by hashing the whole fixture tree,
 rollback from a failure injected into each phase, a state matrix in which every
 artifact starts present and absent, and the documented recovery commands run
-against a fixture backup.
+against a fixture backup. Each of them was checked by breaking the production
+code it guards and confirming it goes red.
 
 **Still not run on physical TS-x70 hardware.** Everything above was validated
 offline.
