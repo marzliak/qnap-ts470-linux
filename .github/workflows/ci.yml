@@ -28,7 +28,7 @@ jobs:
       - name: Byte-compile every Python executable
         run: |
           python3 -m py_compile bin/qnap-tsx70-lcd bin/qnap-tsx70-fancontrol \
-                                scripts/redact.py
+                                scripts/redact.py scripts/qnap_lock.py
 
       - name: Run the test suite
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v

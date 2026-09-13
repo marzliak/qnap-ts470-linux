@@ -15,6 +15,12 @@
 
 set -euo pipefail
 
+# Resolved the same way as in install.sh, and for the same reason: everything
+# this script gates a deletion on comes out of the repository it was run from,
+# not out of the installation it is about to remove. readlink -f so that a
+# symlinked entry point still finds the tree it belongs to.
+REPO_ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)"
+
 # ---------------------------------------------------------------------------
 # Test seams - see the same block in install.sh. Unset, these are the real
 # system paths and the real process table.
@@ -22,6 +28,26 @@ set -euo pipefail
 TEST_ROOT="${QNAP_TSX70_TEST_ROOT:-}"
 PROC_DIR="${QNAP_TSX70_PROC_DIR:-/proc}"
 STOP_TIMEOUT="${QNAP_TSX70_STOP_TIMEOUT:-20}"
+FAN_DEVICE_GLOB="${QNAP_TSX70_DEVICE_GLOB:-/sys/devices/platform/f71882fg.*}"
+
+# The verifier, and the one thing about it that matters: it is the copy in
+# this repository, not the copy in $BIN_DIR.
+#
+# Everything below the handback gate deletes files. The gate's whole value is
+# the exit status of `safe-state`, and until now that status came from the
+# installed binary - the one this script is about to remove, which may be from
+# an older release that verified less, or may have been replaced by something
+# that exits 0 without writing a register at all. Trusting it is trusting the
+# subject of the removal to authorise its own removal.
+#
+# This candidate is the reviewed one. Its safe-state writes both registers and
+# reads pwmN_enable back, and only that readback is allowed to unlock a `rm`.
+FAN_BINARY="${QNAP_TSX70_FAN_BINARY:-$REPO_ROOT/bin/qnap-tsx70-fancontrol}"
+# Not a seam, for the same reason as in install.sh: an override here would let
+# a caller point this run at a lock that no fan writer takes.
+FAN_LOCK_HELPER="$REPO_ROOT/scripts/qnap_lock.py"
+FAN_LOCK_FD=""
+FAN_LOCK_PATH=""
 
 BIN_DIR="$TEST_ROOT/usr/local/bin"
 UNIT_DIR="$TEST_ROOT/etc/systemd/system"
@@ -143,6 +169,7 @@ unit_is_active() {
     esac
 }
 unit_known()      { [ -f "$UNIT_DIR/$1" ] || systemctl list-unit-files "$1" >/dev/null 2>&1; }
+have()            { command -v "$1" >/dev/null 2>&1; }
 
 # --- process identity, matching install.sh ---------------------------------
 pid_is_alive() { [ -d "$PROC_DIR/$1" ]; }
@@ -302,6 +329,94 @@ stop_unit_verified() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# The canonical fan writer lock - the same one install.sh takes, for the same
+# reason. See the long note in scripts/install.sh.
+#
+# The window here is the sharpest of the three: between "no fan-control
+# process remains" and `rm -f $BIN_DIR/$FAN_BIN` there is a handback and a
+# display clear, and a `systemctl start qnap-tsx70-fancontrol` landing in that
+# gap is a writer whose binary is deleted underneath it, with no unit left for
+# systemd to stop it by.
+#
+# The lock is on a descriptor this shell owns, so every exit releases it -
+# including the ones no trap runs for. safe-state takes no lock, so the
+# handback still works while this is held.
+# ---------------------------------------------------------------------------
+fan_lock_acquire() {
+    [ -n "$FAN_LOCK_FD" ] && return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "       [dry-run] hold the fan writer lock across the recheck, the handback and every removal"
+        return 0
+    fi
+    if [ ! -f "$FAN_LOCK_HELPER" ]; then
+        warn "no lock helper at $FAN_LOCK_HELPER, so the fan writer lock cannot"
+        warn "be held and a writer could start between the check below and the"
+        warn "files this run deletes"
+        return 1
+    fi
+    local path
+    if ! path="$(python3 "$FAN_LOCK_HELPER" path 2>&1)" || [ -z "$path" ]; then
+        warn "could not resolve the canonical fan writer lock path: $path"
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$path")"; then
+        warn "could not create the lock directory $(dirname "$path")"
+        return 1
+    fi
+    if ! exec {FAN_LOCK_FD}>>"$path"; then
+        FAN_LOCK_FD=""
+        warn "could not open the fan writer lock $path"
+        return 1
+    fi
+    if python3 "$FAN_LOCK_HELPER" acquire --fd "$FAN_LOCK_FD"; then
+        FAN_LOCK_PATH="$path"
+        ok "holding the fan writer lock $path"
+        return 0
+    fi
+    exec {FAN_LOCK_FD}>&-
+    FAN_LOCK_FD=""
+    warn "another fan writer holds $path. Stop it and re-run:"
+    warn "  systemctl stop $FAN_UNIT"
+    return 1
+}
+
+fan_lock_release() {
+    [ -n "$FAN_LOCK_FD" ] || return 0
+    exec {FAN_LOCK_FD}>&-
+    FAN_LOCK_FD=""
+    ok "released the fan writer lock $FAN_LOCK_PATH"
+    return 0
+}
+
+# fan_verifier_usable - can this repository's verifier actually be run?
+#
+# Checked before anything is mutated and before the lock is taken, because a
+# verifier that cannot run is not a verdict of "unsafe" or "safe" - it is no
+# verdict at all, and the only correct answer to no verdict is to remove
+# nothing. `--version` is the cheapest thing that proves the whole chain:
+# the file is there, it is readable, python3 exists, and the interpreter can
+# parse and execute it. It touches no hardware and writes nothing.
+fan_verifier_usable() {
+    if [ ! -f "$FAN_BINARY" ]; then
+        warn "no fan-control program at $FAN_BINARY"
+        return 1
+    fi
+    if [ ! -r "$FAN_BINARY" ]; then
+        warn "$FAN_BINARY is not readable"
+        return 1
+    fi
+    if ! have python3; then
+        warn "python3 is not on PATH, so $FAN_BINARY cannot be run"
+        return 1
+    fi
+    if ! python3 "$FAN_BINARY" --version >/dev/null 2>&1; then
+        warn "python3 cannot run $FAN_BINARY"
+        return 1
+    fi
+    return 0
+}
+
 fan_abort() {
     warn "refusing to continue: a fan writer may still be running."
     warn "Nothing has been removed, so you can still recover with:"
@@ -324,10 +439,11 @@ safe_state_abort() {
     warn "confirmed back under its own automatic mode."
     warn "$BIN_DIR/$FAN_BIN and $UNIT_DIR/$FAN_UNIT have been left in place so"
     warn "you can recover:"
-    warn "  $BIN_DIR/$FAN_BIN status       # what the chip reports now"
-    warn "  $BIN_DIR/$FAN_BIN safe-state   # retry the handback"
+    warn "  python3 $FAN_BINARY status       # this repository's copy"
+    warn "  python3 $FAN_BINARY safe-state   # must exit 0"
+    warn "  $BIN_DIR/$FAN_BIN safe-state   # the installed copy, if you prefer"
     warn "  grep . /sys/devices/platform/f71882fg.*/pwm*_enable   # 2 = automatic"
-    warn "Re-run this uninstaller once safe-state exits 0."
+    warn "Re-run this uninstaller once this repository's safe-state exits 0."
     die "automatic fan mode could not be verified; nothing was removed"
 }
 
@@ -348,6 +464,14 @@ if unit_known "$FAN_UNIT" || unit_is_active "$FAN_UNIT"; then
     stop_unit_verified "$FAN_UNIT" || fan_abort
     run_quiet systemctl disable "$FAN_UNIT"
     ok "stopped and disabled $FAN_UNIT"
+fi
+
+# The lock, before the recheck it makes meaningful and before the handback.
+# Not taken at all when there is no fan artifact in scope: an uninstall that
+# finds no fan unit, no fan binary and no fan process deletes nothing of fan
+# control and has no writer to exclude.
+if [ "$FAN_WAS_PRESENT" -eq 1 ]; then
+    fan_lock_acquire || fan_abort
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -373,42 +497,36 @@ fi
 
 if [ "$FAN_WAS_PRESENT" -eq 1 ]; then
     step "Handing the fans back to the controller"
-    # Only now, with no live writer to race, is it safe to ask the chip to
-    # take the fans back explicitly. The unit's ExecStopPost normally does
-    # this already; this covers a unit that was removed or never installed.
+    # Only now, with no live writer to race and the writer lock held so none
+    # can start, is it safe to ask the chip to take the fans back explicitly.
+    # The unit's ExecStopPost normally does this already; this covers a unit
+    # that was removed or never installed.
     #
-    # `safe-state` exits 0 only when every controllable channel read back as
-    # automatic mode, so its exit status is the verification - not the fact
-    # that it ran, and not the absence of an error message.
-    if [ -x "$BIN_DIR/$FAN_BIN" ]; then
-        if [ "$DRY_RUN" -eq 1 ]; then
-            info "       [dry-run] $BIN_DIR/$FAN_BIN safe-state"
-            info "       [dry-run] every removal below is gated on its exit status"
-        elif safe_state_out="$("$BIN_DIR/$FAN_BIN" safe-state 2>&1)"; then
-            FAN_SAFE_STATE=1
-            ok "fans handed back to the controller's automatic mode (verified)"
-        else
-            [ -n "$safe_state_out" ] && printf '%s\n' "$safe_state_out" >&2
-            safe_state_abort "$BIN_DIR/$FAN_BIN safe-state did not confirm automatic mode"
-        fi
-    elif [ -f "$BIN_DIR/$FAN_BIN" ]; then
-        # The removal step below deletes whatever `[ -f ]` finds, so whatever
-        # it deletes this gate has to have run. A binary that cannot be
-        # executed is one this gate cannot run.
-        if [ "$DRY_RUN" -eq 1 ]; then
-            info "       [dry-run] would refuse: $BIN_DIR/$FAN_BIN is not executable"
-        else
-            safe_state_abort "$BIN_DIR/$FAN_BIN is not executable, so the fans could not be handed back with it"
-        fi
+    # `safe-state` exits 0 only when every controllable channel was written
+    # and read back as automatic mode, so its exit status is the verification
+    # - not the fact that it ran, and not the absence of an error message.
+    #
+    # It is the repository's copy that is asked. The installed binary is the
+    # subject of this removal: it may predate the readback that makes the
+    # verdict worth anything, and a binary that has been swapped for a stub
+    # that exits 0 would otherwise authorise the deletion of the unit and the
+    # recovery tool in one go. What gets deleted does not get a vote.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "       [dry-run] python3 $FAN_BINARY safe-state"
+        info "       [dry-run] every removal below is gated on its exit status"
+    elif ! fan_verifier_usable; then
+        # No verdict is not a good verdict. Nothing is removed, and the
+        # installed binary and unit stay exactly where they are, because on a
+        # host where the repository verifier cannot run they are the only
+        # remaining way to put a fan back.
+        safe_state_abort "this repository's fan verifier at $FAN_BINARY could not be run, so the handback could not be verified"
+    elif safe_state_out="$(python3 "$FAN_BINARY" safe-state --device-glob "$FAN_DEVICE_GLOB" 2>&1)"; then
+        FAN_SAFE_STATE=1
+        ok "fans handed back to the controller's automatic mode (verified)"
+        info "       verified with this repository's $FAN_BINARY"
     else
-        # Nothing to run and nothing to keep: there is no fan binary to be a
-        # recovery mechanism, and the quiescence check above already proved no
-        # fan-control process survived. Say so plainly and claim nothing.
-        warn "no fan-control binary at $BIN_DIR/$FAN_BIN, so automatic fan mode"
-        warn "could not be verified. No fan-control process is running, so"
-        warn "nothing of this project is driving the PWM registers - but check"
-        warn "the chip yourself before you trust that:"
-        warn "  grep . /sys/devices/platform/f71882fg.*/pwm*_enable   # 2 = automatic"
+        [ -n "$safe_state_out" ] && printf '%s\n' "$safe_state_out" >&2
+        safe_state_abort "$FAN_BINARY safe-state did not confirm automatic mode"
     fi
 fi
 
@@ -456,6 +574,10 @@ if [ "$KEEP_MODULES" -eq 0 ] && [ -f "$MODULES_FILE" ]; then
     [ "$DRY_RUN" -eq 0 ] && ok "removed $MODULES_FILE"
 fi
 run systemctl daemon-reload
+# Every fan binary and unit this run removes is gone, so the lock has done its
+# work. Releasing it here rather than at exit is what lets a reinstall - or an
+# operator's recovery calibrate - start immediately afterwards.
+fan_lock_release
 
 if [ "$PURGE" -eq 1 ]; then
     step "Purging configuration and state"
@@ -480,6 +602,11 @@ elif [ "$FAN_WAS_PRESENT" -eq 0 ]; then
 elif [ "$FAN_SAFE_STATE" -eq 1 ]; then
     info "The fan controller is back under its own automatic mode (verified)."
 else
+    # Restating the gate over the summary. No current ordering reaches this:
+    # with fan control present and this not being a dry run, the handback
+    # above either set FAN_SAFE_STATE or called safe_state_abort, which exits.
+    # It stays so that a new path into this summary announces an unverified
+    # handback instead of inheriting the confident sentence above it.
     warn "Automatic fan mode was NOT verified. No fan-control process is running,"
     warn "so nothing is driving the PWM registers, but check the chip yourself:"
     warn "  grep . /sys/devices/platform/f71882fg.*/pwm*_enable   # 2 = automatic"

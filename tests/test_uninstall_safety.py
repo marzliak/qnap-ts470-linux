@@ -132,25 +132,34 @@ class SafeStateClaimTests(UninstallCase):
     """Automatic mode is only claimed when it was actually confirmed."""
 
     def test_safe_state_runs_only_after_the_writer_is_gone(self):
+        # The order is the point: the quiescence gate first, then the
+        # handback. Asking the chip while a writer is alive is answered by
+        # whichever of the two wrote last. The invocation is observed on the
+        # repository verifier, which is the program the gate actually runs.
         fixture = self._installed(fan_active=True)
-        marker = os.path.join(fixture.harness, "safe-state-ran")
-        fixture.write(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"),
-                      "#!/bin/sh\n[ \"$1\" = safe-state ] && : > %s\nexit 0\n"
-                      % marker, 0o755)
+        fixture.with_fan_chip(enable=1)
 
         result = fixture.uninstall()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(os.path.exists(marker), "safe-state was never invoked")
+        self.assertIn("safe-state", " ".join(fixture.fan_commands()),
+                      "the repository verifier was never invoked")
+        self.assertLess(result.stdout.index("no fan-control process remains"),
+                        result.stdout.index("Handing the fans back"),
+                        "the handback ran before the quiescence gate")
         self.assertIn("automatic mode (verified)", result.stdout)
 
     def test_a_failing_safe_state_stops_the_uninstall(self):
         # This used to warn and carry on, deleting the binary and the unit
         # anyway - so the one command that could have put the fans back was
         # removed precisely because it had reported that it could not.
+        #
+        # The failure is now injected where the verdict actually comes from:
+        # the chip, as read back by this repository's verifier. An installed
+        # binary exiting 1 decides nothing here, and neither does one exiting
+        # 0 - see tests/test_uninstall_verifier.py.
         fixture = self._installed(fan_active=True)
-        fixture.write(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"),
-                      "#!/bin/sh\nexit 1\n", 0o755)
+        fixture.with_fan_chip(enable=1, ignore_writes=["pwm3_enable"])
 
         result = fixture.uninstall()
 
@@ -485,32 +494,39 @@ class SafeStateGateTests(UninstallCase):
         for channel in (1, 3):
             self.assertEqual(fixture.fan_register("pwm%d_enable" % channel), "2")
 
-    def test_a_safe_state_that_cannot_run_at_all_stops_the_uninstall(self):
-        # The binary is there - so the removal step would delete it - but it
-        # cannot be executed, so the gate cannot use it.
-        fixture = self._installed(fan_active=True)
+    def test_the_installed_binarys_mode_is_not_what_decides(self):
+        # The installed binary is not executable, so under the old gate the
+        # run refused. It is not run any more - the repository's verifier is -
+        # so its mode says nothing about whether the fans are back, and the
+        # verdict comes from the chip either way. The removal proceeds because
+        # a real handback was proven, not because a file was chmod'd.
+        fixture = self._with_chip(enable=1)
         os.chmod(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"), 0o644)
 
         result = fixture.uninstall()
 
-        self.assertArtifactsIntact(result)
-        self.assertIn("not executable", result.stderr)
-        self.assertIn("nothing was removed", result.stderr)
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + "\n" + result.stderr)
+        self.assertEqual(fixture.fan_register("pwm3_enable"), "2")
+        self.assertIn("safe-state", " ".join(fixture.fan_commands()))
+        self.assertFalse(fixture.exists("usr/local/bin/qnap-tsx70-fancontrol"))
 
-    def test_a_dry_run_previews_the_refusal_rather_than_a_handback(self):
-        # The preview has to say what the real run would do. Reporting a
-        # safe-state it would never be able to run is the same class of
-        # untruth as claiming one that failed.
-        fixture = self._installed(fan_active=True)
-        os.chmod(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"), 0o644)
+    def test_a_dry_run_previews_the_repository_verifier(self):
+        # The preview has to name the program the real run would use, because
+        # that is the command an operator checks before trusting the gate.
+        fixture = self._with_chip(enable=1)
         before = fixture.snapshot()
 
         result = fixture.uninstall("--dry-run")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(fixture.snapshot(), before)
-        self.assertIn("would refuse", result.stdout)
+        self.assertIn("[dry-run] python3 %s safe-state" % fixture.fan_binary,
+                      result.stdout)
+        self.assertIn("gated on its exit status", result.stdout)
         self.assertNotIn("(verified)", result.stdout)
+        self.assertEqual(fixture.fan_commands(), [],
+                         "a dry run invoked the verifier for real")
 
     def test_the_lcd_is_left_alone_when_the_gate_trips(self):
         # Transactional: the run stops before the LCD service is touched
@@ -524,11 +540,15 @@ class SafeStateGateTests(UninstallCase):
         self.assertNotIn("stop qnap-tsx70-lcd.service", fixture.calls(),
                          "the LCD was stopped by a run that then refused")
 
-    def test_a_leftover_unit_with_no_binary_is_removed_without_a_claim(self):
-        # Nothing to execute and nothing to keep: there is no binary to be a
-        # recovery mechanism. The unit goes, and the summary says plainly that
-        # automatic mode was never confirmed.
+    def test_a_leftover_unit_with_no_binary_is_still_gated(self):
+        # There is no installed binary to execute, and there used to be no
+        # gate either: the unit was deleted with a warning that automatic mode
+        # had never been confirmed. A unit file is a recovery mechanism of its
+        # own - `systemctl start` runs ExecStopPost= on the way back down - so
+        # deleting it unproven removes one. The repository's verifier is
+        # always available, so the gate runs and the removal is earned.
         fixture = self.fixture
+        fixture.with_fan_controller(enable=1)
         fixture.add_unit("qnap-tsx70-fancontrol.service", active=False,
                          enabled=True)
 
@@ -537,8 +557,23 @@ class SafeStateGateTests(UninstallCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(
             fixture.exists("etc/systemd/system/qnap-tsx70-fancontrol.service"))
-        self.assertNotIn("(verified)", result.stdout)
-        self.assertIn("NOT verified", result.stderr)
+        self.assertEqual(fixture.fan_register("pwm3_enable"), "2")
+        self.assertIn("automatic mode (verified)", result.stdout)
+
+    def test_a_leftover_unit_is_kept_when_the_handback_cannot_be_proven(self):
+        # The same machine, on a chip that will not leave manual mode. The
+        # unit stays: it is the only way left to ask the chip again.
+        fixture = self.fixture
+        fixture.with_fan_controller(enable=1, ignore_writes=["pwm3_enable"])
+        fixture.add_unit("qnap-tsx70-fancontrol.service", active=False,
+                         enabled=True)
+
+        result = fixture.uninstall()
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(
+            fixture.exists("etc/systemd/system/qnap-tsx70-fancontrol.service"))
+        self.assertIn("nothing was removed", result.stderr)
 
 
 class FanOnlyTests(UninstallCase):

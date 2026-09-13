@@ -52,6 +52,11 @@ FAN_DEVICE_GLOB="${QNAP_TSX70_DEVICE_GLOB:-/sys/devices/platform/f71882fg.*}"
 # the thing whose behaviour is not trusted here. It is the same rule
 # cache_is_valid already follows for the calibration schema.
 FAN_BINARY="${QNAP_TSX70_FAN_BINARY:-$REPO_ROOT/bin/qnap-tsx70-fancontrol}"
+# Deliberately not a seam. The lock root already has one - QNAP_TSX70_LOCK_DIR,
+# honoured by the fan program itself, which is how two processes are made to
+# contend on purpose - and a second override naming the helper would let a
+# caller point this run at a lock no writer takes.
+FAN_LOCK_HELPER="$REPO_ROOT/scripts/qnap_lock.py"
 
 BIN_DIR="$TEST_ROOT/usr/local/bin"
 UNIT_DIR="$TEST_ROOT/etc/systemd/system"
@@ -108,6 +113,12 @@ TXN_SEQ=0
 TXN_PATHS=()
 TXN_UNITS=()
 TXN_DIRS=()
+# What this run actually changed, as opposed to what it merely recorded.
+# TXN_PATHS is the answer to "what was here before?" and covers every path
+# this script is capable of touching; these two answer "did this run touch
+# it?", and that is the question a rollback near fan control must ask.
+TXN_MUTATED_PATHS=()
+TXN_MUTATED_UNITS=()
 ROLLBACK_NEEDED=0
 ROLLBACK_RUNNING=0
 CACHE_MIGRATED=0
@@ -126,6 +137,10 @@ LEGACY_IN_SCOPE=0
 # else may set it, and no fan recovery artifact is deleted or replaced without
 # it.
 FAN_HANDBACK_VERIFIED=0
+# The descriptor this shell holds the canonical fan writer lock on, and the
+# path it names. Empty means "not held": see fan_lock_acquire.
+FAN_LOCK_FD=""
+FAN_LOCK_PATH=""
 FAN_SCOPE_UNITS=()
 FAN_SCOPE_BINS=()
 LCD_SCOPE_UNITS=()
@@ -803,6 +818,35 @@ txn_record_path() {
         >> "$TXN_DIR/manifest.tsv"
 }
 
+# txn_touch_path <path> - this run changed this file: wrote it, replaced it
+# or deleted it. Recorded separately from the manifest because the manifest
+# is a snapshot of everything this script could touch, and "could" is not
+# "did". A rollback that treats the two as the same thing undoes changes
+# nobody made - which for a fan binary means replacing the executable an
+# operator is recovering with, during a failure that had nothing to do with
+# fan control.
+txn_touch_path() {
+    in_list "$1" ${TXN_MUTATED_PATHS[@]+"${TXN_MUTATED_PATHS[@]}"} && return 0
+    TXN_MUTATED_PATHS+=("$1")
+    return 0
+}
+
+# txn_touch_unit <unit> - this run changed what this unit is doing: stopped
+# it, started it, enabled it or disabled it.
+txn_touch_unit() {
+    in_list "$1" ${TXN_MUTATED_UNITS[@]+"${TXN_MUTATED_UNITS[@]}"} && return 0
+    TXN_MUTATED_UNITS+=("$1")
+    return 0
+}
+
+txn_path_was_mutated() {
+    in_list "$1" ${TXN_MUTATED_PATHS[@]+"${TXN_MUTATED_PATHS[@]}"}
+}
+
+txn_unit_was_mutated() {
+    in_list "$1" ${TXN_MUTATED_UNITS[@]+"${TXN_MUTATED_UNITS[@]}"}
+}
+
 txn_record_unit() {
     local unit="$1" enabled=0 active=0
     unit_is_enabled "$unit" && enabled=1
@@ -881,6 +925,10 @@ make_backup() {
 stop_unit_verified() {
     local unit="$1"
     unit_is_active "$unit" || { ok "$unit already inactive"; return 0; }
+    # Past this line the unit's activity is this run's doing. The early return
+    # above is not: a unit that was already inactive was not stopped by us,
+    # and a rollback has nothing of its to put back.
+    txn_touch_unit "$unit"
     if ! run systemctl stop "$unit"; then
         warn "systemctl stop $unit failed"
         return 1
@@ -933,6 +981,88 @@ fan_recovery_hint() {
     warn "then re-run this installer."
 }
 
+# ---------------------------------------------------------------------------
+# The canonical fan writer lock
+#
+# Stopping a unit and then reading the process table proves something about
+# one instant. Between that instant and the `install` or the `rm` that follows
+# it, a `systemctl start qnap-tsx70-fancontrol`, a boot-time activation or an
+# operator's `calibrate` can begin - and that is a fan writer whose executable
+# is about to be replaced or deleted underneath it, which is precisely what
+# the check was there to prevent. The window closes only by holding the lock
+# the writers themselves take, across the whole of it.
+#
+# It is the same lock, not a second one that resembles it: scripts/qnap_lock.py
+# reads the path out of bin/qnap-tsx70-fancontrol rather than defining one, so
+# the two sides cannot drift apart. Only the canonical global lock is taken -
+# the one every writer takes first, whatever controller it resolved and
+# whatever --cache it was given - so holding it excludes all of them, no
+# device discovery is needed here, and no flag any operator can pass moves it.
+#
+# The lock lives on a descriptor this shell owns, so releasing it is closing a
+# file. That makes the cleanup unconditional rather than careful: every exit
+# releases it, including the ones no trap can run for, so an installer killed
+# mid-run leaves no lock claiming an owner that no longer exists. The explicit
+# release below exists for the opposite reason - a fan service started while
+# this still held the lock would be refused at its own and fail to come up, so
+# the hold has to end at the last protected mutation and not at the end of the
+# script. install_files() and rollback() are where each of those ends.
+#
+# safe-state deliberately takes no lock, so the verified handback below still
+# works while this is held. That is the property that keeps this from
+# deadlocking against the emergency recovery it depends on.
+# ---------------------------------------------------------------------------
+fan_lock_acquire() {
+    [ -n "$FAN_LOCK_FD" ] && return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '       [dry-run] hold the fan writer lock across the recheck, the handback and every replacement\n'
+        return 0
+    fi
+    if [ ! -f "$FAN_LOCK_HELPER" ]; then
+        warn "no lock helper at $FAN_LOCK_HELPER, so the fan writer lock"
+        warn "cannot be held and a writer could start between the check below"
+        warn "and the files this run replaces"
+        return 1
+    fi
+    local path
+    if ! path="$(python3 "$FAN_LOCK_HELPER" path 2>&1)" || [ -z "$path" ]; then
+        warn "could not resolve the canonical fan writer lock path: $path"
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$path")"; then
+        warn "could not create the lock directory $(dirname "$path")"
+        return 1
+    fi
+    # Appended to, never truncated: another process's recorded PID is not this
+    # script's to erase, and the lock is on the descriptor either way.
+    if ! exec {FAN_LOCK_FD}>>"$path"; then
+        FAN_LOCK_FD=""
+        warn "could not open the fan writer lock $path"
+        return 1
+    fi
+    if python3 "$FAN_LOCK_HELPER" acquire --fd "$FAN_LOCK_FD"; then
+        FAN_LOCK_PATH="$path"
+        ok "holding the fan writer lock $path"
+        return 0
+    fi
+    exec {FAN_LOCK_FD}>&-
+    FAN_LOCK_FD=""
+    warn "another fan writer holds $path. Stop it and re-run:"
+    warn "  systemctl stop $NEW_FAN_UNIT"
+    return 1
+}
+
+# fan_lock_release - give the lock up deliberately, before a fan service is
+# allowed to start. Never fails: closing a descriptor this shell owns cannot,
+# and every caller is on a path that must not abort here.
+fan_lock_release() {
+    [ -n "$FAN_LOCK_FD" ] || return 0
+    exec {FAN_LOCK_FD}>&-
+    FAN_LOCK_FD=""
+    ok "released the fan writer lock $FAN_LOCK_PATH"
+    return 0
+}
+
 # stop_fan_services - every fan writer this run is about to replace or delete,
 # off and proven off. Units first, then the bare legacy daemon named by its PID
 # file, and only then the quiescence gate: the PID-file process is a fan writer
@@ -941,7 +1071,9 @@ fan_recovery_hint() {
 #
 # Nothing happens here when the scope is empty, which is the LCD-only,
 # no-migration case: this run writes no fan binary and deletes none, so a fan
-# service that is running is not its business and is left running.
+# service that is running is not its business, is left running, and the writer
+# lock is not taken either - an operation with no fan artifact in scope has no
+# reason to exclude the writers.
 stop_fan_services() {
     local unit
     if [ "${#FAN_SCOPE_UNITS[@]}" -eq 0 ]; then
@@ -961,6 +1093,15 @@ stop_fan_services() {
         fi
     done
     if [ "$LEGACY_IN_SCOPE" -eq 1 ] && ! stop_legacy_pid_process; then
+        fan_recovery_hint
+        return 1
+    fi
+    # Here, and not after the recheck: the lock is what makes the recheck
+    # mean anything past the instant it runs. Taken once the units this run
+    # owns are down, so it is not contending with a writer that was about to
+    # be stopped anyway, and held from here through the handback, the file
+    # replacements and the legacy deletions.
+    if ! fan_lock_acquire; then
         fan_recovery_hint
         return 1
     fi
@@ -1251,6 +1392,7 @@ migrate_cache() {
         info "       at $LEGACY_CACHE as well"
     elif cache_is_valid "$LEGACY_CACHE"; then
         install -m 0644 "$LEGACY_CACHE" "$CACHE_FILE"
+        txn_touch_path "$CACHE_FILE"
         CACHE_MIGRATED=1
         ok "migrated calibration cache to $CACHE_FILE"
     else
@@ -1298,8 +1440,10 @@ remove_legacy() {
     for unit in "${LEGACY_UNITS[@]}"; do
         unit_exists "$unit" || continue
         run_quiet systemctl disable "$unit"
+        txn_touch_unit "$unit"
         if [ -f "$UNIT_DIR/$unit" ]; then
             run rm -f "$UNIT_DIR/$unit"
+            txn_touch_path "$UNIT_DIR/$unit"
             [ "$DRY_RUN" -eq 0 ] && ok "removed $unit"
         else
             # Known to systemd but not ours to delete: it is shipped
@@ -1311,12 +1455,14 @@ remove_legacy() {
     for bin in "${LEGACY_BINS[@]}"; do
         if [ -f "$BIN_DIR/$bin" ]; then
             run rm -f "$BIN_DIR/$bin"
+            txn_touch_path "$BIN_DIR/$bin"
             [ "$DRY_RUN" -eq 0 ] && ok "removed $BIN_DIR/$bin"
         fi
     done
     if [ -f "$LEGACY_CACHE" ]; then
         if [ "$CACHE_MIGRATED" -eq 1 ] && cache_is_valid "$CACHE_FILE"; then
             run rm -f "$LEGACY_CACHE"
+            txn_touch_path "$LEGACY_CACHE"
             ok "removed $LEGACY_CACHE (migrated and validated)"
         elif [ "$CACHE_SUPERSEDED" -eq 1 ]; then
             info "       kept $LEGACY_CACHE: a newer calibration is already in"
@@ -1336,6 +1482,7 @@ remove_legacy() {
             return 1
         else
             run rm -f "$LEGACY_PID"
+            txn_touch_path "$LEGACY_PID"
             ok "removed $LEGACY_PID"
         fi
     fi
@@ -1349,16 +1496,23 @@ remove_legacy() {
 # ---------------------------------------------------------------------------
 # Rollback
 #
-# A rollback runs after enable_services(), which is where restore_fan_activity()
-# starts a fan service that was running before the install back up. By the time
-# the restore below replaces the fan binary and the unit file, that service is
-# a live writer again - and FAN_HANDBACK_VERIFIED, earned before any of it,
+# A rollback can be reached from anywhere after the first change, including
+# from the last line of main(), where restore_fan_activity() has just started
+# a fan service that was running before the install back up. By the time the
+# restore below would replace the fan binary and the unit file, that service
+# is a live writer again - and FAN_HANDBACK_VERIFIED, earned before any of it,
 # describes a machine that no longer exists. Putting a file back is the same
 # act as deleting it as far as a fan parked in manual mode is concerned: it
 # takes away the executable an operator would recover with, for as long as it
 # takes, and hands the unit a different binary. So the rollback proves it
 # again, from scratch, or it leaves every fan recovery artifact exactly where
 # this install left it and says so.
+#
+# All of which applies only to the fan artifacts this transaction actually
+# changed. A rollback that would restore no fan file and restart no fan unit
+# has no fan hazard to gate, and reaching for one - stopping the service,
+# scanning for its processes, writing to the controller - is itself the
+# hazard. rollback_touches_fan_artifacts() is where that line is drawn.
 # ---------------------------------------------------------------------------
 
 # is_fan_artifact_path <path> - is this file somebody's way back from a fan
@@ -1384,29 +1538,53 @@ is_fan_unit() {
     return 1
 }
 
-# rollback_touches_fan_artifacts - would putting the manifest back replace or
-# remove a fan binary or unit?
+# rollback_touches_fan_artifacts - would undoing this transaction change a fan
+# binary, a fan unit file, or what a fan unit is doing?
 #
-# Answered from the manifest and the current tree, not from the install-time
-# scope: the scope is what this run meant to change, and a rollback undoes
-# everything that was recorded. A transaction with no fan artifact in it - the
-# LCD-only install on a machine that has never had fan control - reaches no
-# gate and writes to no controller, which is the same rule verify_fan_handback
-# follows on the way in.
+# Answered from what this run actually changed, not from what it recorded.
+# That distinction is the whole finding: txn_snapshot_all() records every path
+# this script is capable of touching, including the fan binary and both fan
+# units, on every run. Reading the manifest made an LCD-only install on a
+# machine that happens to have fan control look exactly like a fan install -
+# so a failure anywhere in it stopped a fan service nobody had asked this run
+# to touch, ran a handback against a controller it had no business writing to,
+# and restored a fan binary that had never been replaced.
+#
+# The question a rollback has to ask is narrower and is the one below: did
+# *this* transaction write, replace, delete, stop, start, enable or disable a
+# fan artifact? If it did not, fan control is not part of the rollback, no
+# unit of it is stopped, no process of it is scanned for, no safe-state is
+# run, and no file of it is restored or removed - which is the same rule
+# verify_fan_handback follows on the way in.
 rollback_touches_fan_artifacts() {
-    local path existed mode blob
-    while IFS=$'\t' read -r path existed mode blob; do
-        [ -n "$path" ] || continue
-        is_fan_artifact_path "$path" || continue
-        if [ "$existed" -eq 1 ]; then
-            if [ "$blob" != "-" ] && [ -f "$TXN_DIR/files/$blob" ]; then
-                return 0
-            fi
-        elif [ -e "$path" ]; then
-            return 0
-        fi
-    done < "$TXN_DIR/manifest.tsv"
+    local path unit
+    for path in ${TXN_MUTATED_PATHS[@]+"${TXN_MUTATED_PATHS[@]}"}; do
+        is_fan_artifact_path "$path" && return 0
+    done
+    for unit in ${TXN_MUTATED_UNITS[@]+"${TXN_MUTATED_UNITS[@]}"}; do
+        is_fan_unit "$unit" && return 0
+    done
     return 1
+}
+
+# fan_path_out_of_scope <path> - a fan file this transaction never changed.
+# Putting it back would replace the executable an operator recovers with, in
+# the middle of a rollback that has nothing to do with fan control, and the
+# bytes it would write are the bytes already there.
+fan_path_out_of_scope() {
+    is_fan_artifact_path "$1" || return 1
+    txn_path_was_mutated "$1" && return 1
+    return 0
+}
+
+# fan_unit_out_of_scope <unit> - a fan unit whose activity and enablement this
+# transaction never changed. Step 4 below "restores" activity by restarting
+# every unit that was active at snapshot time, and a restart of a fan service
+# this run never stopped is a fan service stopped by the rollback.
+fan_unit_out_of_scope() {
+    is_fan_unit "$1" || return 1
+    txn_unit_was_mutated "$1" && return 1
+    return 0
 }
 
 # rollback_fan_gate - a fresh quiescence and handback verdict for the rollback
@@ -1429,6 +1607,16 @@ rollback_fan_gate() {
             return 1
         fi
     done
+    # The same lock, in the same place in the same order: after the units are
+    # down and before the recheck that the restoration below depends on. A
+    # rollback reached without it - a failure early enough in main() that
+    # stop_fan_services never ran - takes it here instead, and one that
+    # already holds it keeps the one it has.
+    if ! fan_lock_acquire; then
+        warn "the fan writer lock could not be taken, so a writer could start"
+        warn "between this check and the files this rollback would restore"
+        return 1
+    fi
     if ! wait_for_no_process "fan control" "${ROLLBACK_FAN_BINS[@]}"; then
         warn "a fan writer is still running, so the controller cannot be asked"
         return 1
@@ -1493,6 +1681,12 @@ rollback() {
             warn "no fan binary or unit will be restored or removed by this"
             warn "rollback; everything else is still put back"
         fi
+    else
+        # Nothing of fan control was changed by this transaction, so nothing
+        # of it is undone: no unit is stopped, no process is scanned for, no
+        # handback is run and no file is restored or removed. A fan service
+        # running right now goes on running.
+        ok "this transaction changed no fan binary or unit; fan control is not part of this rollback"
     fi
 
     local unit enabled active
@@ -1500,6 +1694,9 @@ rollback() {
     #    those units point at are replaced.
     while IFS=$'\t' read -r unit enabled active; do
         [ -n "$unit" ] || continue
+        if fan_unit_out_of_scope "$unit"; then
+            continue
+        fi
         if [ "$active" -eq 0 ] && unit_is_active "$unit"; then
             systemctl stop "$unit" >/dev/null 2>&1 || failures=$((failures + 1))
         fi
@@ -1512,6 +1709,12 @@ rollback() {
     local path existed mode blob
     while IFS=$'\t' read -r path existed mode blob; do
         [ -n "$path" ] || continue
+        if fan_path_out_of_scope "$path"; then
+            # Not this transaction's file. Its bytes on disk are the bytes
+            # that were there when this run started, and replacing them would
+            # take the recovery executable away for as long as it takes.
+            continue
+        fi
         if [ "$ROLLBACK_FAN_GATE" -eq 2 ] && is_fan_artifact_path "$path"; then
             # Left exactly as this install wrote it. An unproven handback
             # means a fan may be parked at a stall duty, and this file is how
@@ -1554,8 +1757,16 @@ rollback() {
     #    fan artifact this rollback intended to restore is back on disk, so it
     #    cannot come up against a binary or a unit file that is still the one
     #    the failed install wrote.
+    # Every file this rollback intended to put back is back, so the lock has
+    # done its work - and it has to come off before the loop below, which
+    # starts services. A fan service started while this still held the lock
+    # would be refused at its own and fail to come up.
+    fan_lock_release
     while IFS=$'\t' read -r unit enabled active; do
         [ -n "$unit" ] || continue
+        if fan_unit_out_of_scope "$unit"; then
+            continue
+        fi
         if [ "$ROLLBACK_FAN_GATE" -eq 2 ] && is_fan_unit "$unit"; then
             warn "not enabling or starting $unit: its binary and unit file were"
             warn "left as this install wrote them"
@@ -1615,24 +1826,29 @@ install_files() {
     step "Installing files"
     txn_mkdir "$STATE_DIR" 0755
     run install -m 0755 "$REPO_ROOT/bin/qnap-tsx70-lcd" "$BIN_DIR/qnap-tsx70-lcd"
+    txn_touch_path "$BIN_DIR/qnap-tsx70-lcd"
     ok "installed $BIN_DIR/qnap-tsx70-lcd"
 
     if [ -f "$CONF_FILE" ]; then
         ok "kept existing $CONF_FILE (see config/qnap-tsx70-lcd.conf.example for new keys)"
     else
         run install -m 0644 "$REPO_ROOT/config/qnap-tsx70-lcd.conf.example" "$CONF_FILE"
+        txn_touch_path "$CONF_FILE"
         ok "installed $CONF_FILE"
     fi
 
     run install -m 0644 "$REPO_ROOT/systemd/qnap-tsx70-lcd.service" \
         "$UNIT_DIR/$NEW_LCD_UNIT"
+    txn_touch_path "$UNIT_DIR/$NEW_LCD_UNIT"
     ok "installed $NEW_LCD_UNIT"
 
     if [ "$WITH_FAN" -eq 1 ]; then
         run install -m 0755 "$REPO_ROOT/bin/qnap-tsx70-fancontrol" \
             "$BIN_DIR/qnap-tsx70-fancontrol"
+        txn_touch_path "$BIN_DIR/qnap-tsx70-fancontrol"
         run install -m 0644 "$REPO_ROOT/systemd/qnap-tsx70-fancontrol.service" \
             "$UNIT_DIR/$NEW_FAN_UNIT"
+        txn_touch_path "$UNIT_DIR/$NEW_FAN_UNIT"
         txn_mkdir "$(dirname "$MODULES_FILE")" 0755
         if [ "$DRY_RUN" -eq 1 ]; then
             printf '       [dry-run] write coretemp and f71882fg to %s\n' \
@@ -1641,10 +1857,25 @@ install_files() {
             printf 'coretemp\nf71882fg\n' > "$MODULES_FILE"
             chmod 0644 "$MODULES_FILE"
         fi
+        txn_touch_path "$MODULES_FILE"
         run modprobe f71882fg 2>/dev/null || warn "modprobe f71882fg failed"
         run modprobe coretemp 2>/dev/null || true
         ok "installed fan control (experimental)"
     fi
+    # The two `install` calls above are the whole reason this run holds the
+    # canonical writer lock: they replace the binary and the unit file that a
+    # `qnap-tsx70-fancontrol run` or `calibrate` executes, and the lock is
+    # what stopped one from starting between the quiescence recheck and them.
+    # Those files are now final, so the lock comes off here rather than later.
+    #
+    # Later would be wrong, not merely generous: enable_services() calls
+    # restore_fan_activity(), which starts a fan writer, and a writer started
+    # while this script still held the lock would be refused at its own and
+    # fail to come up. And later would buy nothing - what remove_legacy()
+    # deletes is saturn-* artifacts, which are driven by a program that
+    # predates this lock and never takes it. Their protection is the process
+    # gate and the PID-file handling, which is where it has to be.
+    fan_lock_release
 }
 
 enable_services() {
@@ -1652,6 +1883,7 @@ enable_services() {
     run systemctl daemon-reload
     run systemctl enable "$NEW_LCD_UNIT"
     run systemctl restart "$NEW_LCD_UNIT"
+    txn_touch_unit "$NEW_LCD_UNIT"
     ok "qnap-tsx70-lcd enabled and started"
 
     if [ "$WITH_FAN" -eq 1 ]; then
@@ -1662,6 +1894,7 @@ enable_services() {
         # run too rather than being silently skipped.
         if cache_is_valid "$CACHE_FILE"; then
             run systemctl enable "$NEW_FAN_UNIT"
+            txn_touch_unit "$NEW_FAN_UNIT"
             ok "qnap-tsx70-fancontrol enabled: $CACHE_FILE validates"
             info "       it is NOT started here; start it when you are watching:"
             info "         systemctl start qnap-tsx70-fancontrol"
@@ -1679,6 +1912,10 @@ enable_services() {
             info "         qnap-tsx70-fancontrol calibrate --yes"
             info "         systemctl enable --now qnap-tsx70-fancontrol"
         fi
+        # Safe here only because install_files() released the writer lock on
+        # its way out: this starts a fan writer, and a writer started while
+        # this run still held the lock would be refused at its own and fail to
+        # come up.
         restore_fan_activity
     fi
 }
@@ -1688,10 +1925,16 @@ enable_services() {
 # change to the machine nobody asked for, so it goes back up. Without a valid
 # calibration it cannot: starting it would fail at once and burn the unit's
 # start limit, so that case is reported instead of guessed at.
+#
+# Ordering: this runs after install_files(), which is where the fan binary and
+# unit reach their final bytes and where the writer lock comes off. A service
+# started before either would be running the old binary, or would be refused
+# at a lock this script was still holding.
 restore_fan_activity() {
     [ "$FAN_UNIT_WAS_ACTIVE" -eq 1 ] || return 0
     if cache_is_valid "$CACHE_FILE"; then
         run systemctl restart "$NEW_FAN_UNIT"
+        txn_touch_unit "$NEW_FAN_UNIT"
         ok "restarted $NEW_FAN_UNIT: it was active before this install"
     else
         warn "$NEW_FAN_UNIT was active before this install and was stopped to"
@@ -1700,6 +1943,55 @@ restore_fan_activity() {
         warn "  qnap-tsx70-fancontrol calibrate --yes"
         warn "  systemctl start qnap-tsx70-fancontrol"
     fi
+}
+
+# report_fan_state - say what the fan service is actually doing, not what a
+# default install would be doing.
+#
+# This line used to be an unconditional "Fan control is installed but NOT
+# running", which is true of a fresh --with-fan-control install and false of
+# the case directly above it: a reinstall over a machine whose fan service was
+# already calibrated and active, which stop_fan_services() stopped so the
+# binary could be replaced and restore_fan_activity() has just started again.
+# Telling that operator their fans are unmanaged is worse than saying nothing
+# - it is the sentence that makes them go and start a second writer.
+#
+# Every query here is best-effort on purpose. The install has already
+# succeeded by this point and `set -e` is still armed, so a systemctl that
+# answers "disabled" with exit 1 - which is what it does - must not turn a
+# finished install into a failed one. Hence the `|| true` shape and no
+# unguarded command substitutions.
+report_fan_state() {
+    local active=0 enabled=0
+    unit_is_active "$NEW_FAN_UNIT" && active=1
+    unit_is_enabled "$NEW_FAN_UNIT" && enabled=1
+
+    if [ "$active" -eq 1 ]; then
+        ok "Fan control is installed and RUNNING ($NEW_FAN_UNIT is active)."
+        if [ "$enabled" -eq 1 ]; then
+            info "It is enabled, so it starts at boot too."
+        else
+            info "It is NOT enabled, so it will not start at the next boot:"
+            info "  systemctl enable qnap-tsx70-fancontrol"
+        fi
+        info "Watch it: journalctl -u qnap-tsx70-fancontrol -f"
+        info "Stop it and hand the fans back: systemctl stop qnap-tsx70-fancontrol"
+        return 0
+    fi
+
+    warn "Fan control is installed but NOT running."
+    if [ "$enabled" -eq 1 ]; then
+        info "It is enabled, so it will start at the next boot."
+        info "Start it now while you are watching:"
+        info "  systemctl start qnap-tsx70-fancontrol"
+        return 0
+    fi
+    info "It needs a calibration run that deliberately stalls the fan."
+    info "Read docs/FAN_CONTROL.md first, then:"
+    info "  qnap-tsx70-fancontrol status"
+    info "  qnap-tsx70-fancontrol calibrate --yes"
+    info "  systemctl enable --now qnap-tsx70-fancontrol"
+    return 0
 }
 
 validate() {
@@ -1831,12 +2123,7 @@ main() {
     info "Guide:        docs/LCD_GUIDE.md"
     if [ "$WITH_FAN" -eq 1 ]; then
         info ""
-        warn "Fan control is installed but NOT running."
-        info "It needs a calibration run that deliberately stalls the fan."
-        info "Read docs/FAN_CONTROL.md first, then:"
-        info "  qnap-tsx70-fancontrol status"
-        info "  qnap-tsx70-fancontrol calibrate --yes"
-        info "  systemctl enable --now qnap-tsx70-fancontrol"
+        report_fan_state
     fi
     if [ "$legacy" -eq 1 ]; then
         info ""

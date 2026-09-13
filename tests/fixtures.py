@@ -12,7 +12,9 @@ this module supplies the other side of them:
   QNAP_TSX70_KILL        a recorded stand-in for kill(1)
   QNAP_TSX70_DEVICE_GLOB a disposable directory that stands in for the chip
   QNAP_TSX70_FAN_BINARY  the shipped fan program, pointed at that chip
-  QNAP_TSX70_LOCK_DIR    a disposable directory that stands in for /run
+  QNAP_TSX70_LOCK_DIR    a disposable directory that stands in for /run, and
+                         the lock root the lifecycle scripts and the writers
+                         both resolve, so two of them can be made to contend
   PATH                   fake systemctl, fuser and modprobe, ahead of the real ones
 
 The fake root is snapshotted by content and mode, which is what makes
@@ -25,6 +27,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 
 from helpers import REPO_ROOT
@@ -313,8 +316,56 @@ module.write_sysfs = write_sysfs
 with open(os.environ["FAKE_FAN_LOG"], "a", encoding="utf-8") as fh:
     fh.write(" ".join(sys.argv[1:]) + "\n")
 
+# A command run at exactly the moment a lifecycle script has taken the writer
+# lock and has not yet replaced or deleted anything: install.sh, uninstall.sh
+# and rollback() all reach their verified handback there and nowhere else.
+# That makes this the one deterministic seam for "start a real writer in the
+# middle of the window", with no sleeps and no polling.
+race = os.environ.get("FAKE_FAN_RACE_CMD", "")
+if race and "safe-state" in sys.argv[1:]:
+    import subprocess
+    attempt = subprocess.run(["/bin/sh", "-c", race], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, universal_newlines=True,
+                             timeout=120)
+    with open(os.environ["FAKE_FAN_RACE_LOG"], "a", encoding="utf-8") as fh:
+        fh.write("=== rc=%d\n%s" % (attempt.returncode, attempt.stdout))
+
 sys.exit(module.main(sys.argv[1:]
                      + ["--device-glob", os.environ["FAKE_FAN_DEVICE_GLOB"]]))
+'''
+
+# A real `qnap-tsx70-fancontrol calibrate`, started to find out whether it can
+# take the canonical writer lock.
+#
+# It is the shipped program, not a stub that calls flock: the lock scheme under
+# test is the one the writers actually use, and a stub would pass against a
+# lifecycle script that took some other lock. Two seams, both of them existing
+# ones: geteuid answers 0 because the suite does not run as root, and
+# find_temp_input answers None instead of globbing the host's /sys.
+#
+# --channels 99 names a channel the fake chip does not have, so the run ends
+# immediately after the locks are taken and never sweeps a fan. That is what
+# makes the outcome legible: "another instance holds" means it was refused at
+# the lock, and "no controllable fan channel" means it got past the lock and
+# stopped for its own reason - which is proof of ownership, not of failure.
+RACE_WRITER = r'''#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+os.geteuid = lambda: 0
+
+loader = importlib.machinery.SourceFileLoader(
+    "fanctl_racer", os.environ["FAKE_FAN_SOURCE"])
+spec = importlib.util.spec_from_loader("fanctl_racer", loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+module.find_temp_input = lambda sensor: None
+
+sys.exit(module.main(["calibrate", "--yes", "--dry-run", "--channels", "99",
+                      "--device-glob", os.environ["FAKE_FAN_DEVICE_GLOB"],
+                      "--cache", os.environ["FAKE_FAN_RACE_CACHE"]]))
 '''
 
 MUTATING_VERBS = ("stop", "start", "restart", "enable", "disable",
@@ -601,6 +652,48 @@ class ShellFixture:
         self._write_exec(os.path.join(self.bin_dir, "qnap-tsx70-fancontrol"),
                          FAKE_FAN_BINARY)
         return device
+
+    # -- the writer-lock race ------------------------------------------------
+    def with_race_writer(self):
+        """Arm a real fan writer to start inside the lifecycle's locked window.
+
+        The attempt happens while the lifecycle script is invoking the
+        verifier's `safe-state`, which every one of install.sh, uninstall.sh
+        and rollback() reaches after taking the lock and before replacing or
+        deleting anything. Nothing here sleeps or polls: the ordering is
+        structural.
+        """
+        self.race_script = os.path.join(self.harness, "race-writer.py")
+        self._write_exec(self.race_script, RACE_WRITER)
+        self.race_log = os.path.join(self.fake_state, "race.log")
+        open(self.race_log, "w").close()
+        self.extra_env.update({
+            "FAKE_FAN_RACE_CMD": "%s %s" % (sys.executable, self.race_script),
+            "FAKE_FAN_RACE_LOG": self.race_log,
+            "FAKE_FAN_RACE_CACHE": os.path.join(self.harness,
+                                                "race-calibration.json"),
+        })
+        return self.race_script
+
+    def race_attempts(self):
+        """[(returncode, output)] for every writer started inside the window."""
+        with open(self.race_log, encoding="utf-8") as fh:
+            body = fh.read()
+        attempts = []
+        for block in body.split("=== rc=")[1:]:
+            code, _, output = block.partition("\n")
+            attempts.append((int(code.strip()), output))
+        return attempts
+
+    def run_writer(self):
+        """Start the same real writer now, with no lifecycle script running."""
+        script = getattr(self, "race_script", None)
+        if script is None:
+            script = self.with_race_writer()
+        return subprocess.run([sys.executable, script], env=self.env(),
+                              cwd=REPO_ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, universal_newlines=True,
+                              timeout=180)
 
     def fan_register(self, name):
         """Current contents of one register of the fake chip."""

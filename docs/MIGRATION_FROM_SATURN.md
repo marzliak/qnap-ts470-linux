@@ -403,15 +403,30 @@ For fan control, additionally install `bin/qnap-tsx70-fancontrol` and
 The automatic rollback runs by itself on a failed install. To go back
 deliberately afterwards, use the backup directory the installer reported.
 
-If the failed install had already restarted fan control, the rollback proves
-the handback again before it restores or removes a fan binary or unit: it stops
-every fan unit that may be running, checks that no fan writer survived, and
-runs `safe-state` once more. It reuses nothing from the start of the run. If
-any of that fails, it rolls back everything else, leaves every fan binary and
-unit exactly as the failed install wrote them, prints `INCOMPLETE ROLLBACK`
-with the paths it left alone — also written to `txn/fan-rollback-skipped` in
-the backup directory — and exits nonzero. Recover the fans first, then restore
-those paths by hand with the block below.
+A rollback undoes what the run **changed**, which is narrower than what it
+recorded: the manifest lists every path the installer is capable of touching,
+including the fan binary and both fan units, on every run. So the fan gate
+below applies only when this transaction actually wrote, replaced, deleted,
+stopped, started, enabled or disabled a fan artifact — a `--with-fan-control`
+install, or a migration removing the legacy `saturn-*` fan files.
+
+A failed LCD-only install on a machine that happens to run fan control reaches
+none of it. It does not stop the fan service, does not look for its processes,
+does not run `safe-state`, does not restore or remove its files, and does not
+change whether it is enabled or active. It says so: *this transaction changed
+no fan binary or unit; fan control is not part of this rollback.*
+
+When the gate does apply — including when the failed install had already
+restarted fan control — the rollback proves the handback again before it
+restores or removes a fan binary or unit: it stops every fan unit that may be
+running, takes the global writer lock, checks that no fan writer survived, and
+runs `safe-state` once more. It reuses nothing from the start of the run. It
+holds that lock across the file restoration and releases it before it starts
+any service again. If any of that fails, it rolls back everything else, leaves
+every fan binary and unit exactly as the failed install wrote them, prints
+`INCOMPLETE ROLLBACK` with the paths it left alone — also written to
+`txn/fan-rollback-skipped` in the backup directory — and exits nonzero.
+Recover the fans first, then restore those paths by hand with the block below.
 
 This block deletes the new binaries and units, so it carries the same guards
 as the manual migration, aimed at the artifacts it is the one removing: the

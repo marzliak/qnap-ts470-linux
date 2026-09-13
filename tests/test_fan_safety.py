@@ -572,7 +572,7 @@ class CalibrationWriteGateTests(CalibrationCase):
             fail_when=nth_write("pwm3_enable", fan.PWM_MANUAL))
 
         self.assertEqual(code, 1, printed)
-        self.assertIn("did not accept the manual-mode command", printed)
+        self.assertIn("channel 3 is not in manual mode", printed)
         self.assertFalse(os.path.exists(self.cache))
         # Nothing was measured, so no duty was ever commanded. The safe state
         # writes full duty on the way out; that is the only pwm3 write here.
@@ -817,7 +817,7 @@ class RuntimeWriteAccountingTests(unittest.TestCase):
         code, written, printed = self.run_loop(fail=["pwm1_enable"])
 
         self.assertEqual(code, 1, printed)
-        self.assertIn("did not accept the manual-mode command", printed)
+        self.assertIn("are not in manual mode", printed)
         self.assertIn("[1]", printed)
         # A curve was never driven: the only duty written is the safe state.
         duties = [v for name, v in written if name in ("pwm1", "pwm3")]
@@ -851,7 +851,7 @@ class RuntimeWriteAccountingTests(unittest.TestCase):
         code, _, printed = self.run_loop()
 
         self.assertEqual(code, 0, printed)
-        self.assertNotIn("manual-mode command", printed)
+        self.assertNotIn("not in manual mode", printed)
 
 
 class WriteAccountingUnitTests(unittest.TestCase):

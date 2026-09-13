@@ -298,6 +298,87 @@ Three more paths where a guard was in place and something walked around it.
   reaches no gate and writes to no controller, which is the same scope rule the
   install-time gate follows.
 
+### Fixed — sixth review pass: the verifier, the readback, the scope and the lock
+
+Four more, in ascending order of how quietly they failed.
+
+- **The uninstaller no longer lets the binary it is deleting authorise the
+  deletion.** Every removal in `scripts/uninstall.sh` was gated on the exit
+  status of `$BIN_DIR/qnap-tsx70-fancontrol safe-state` — the installed copy,
+  which is the subject of the removal. An older release whose safe-state
+  verified less exits 0 on exactly the chip this gate exists to catch, and a
+  binary replaced by anything that exits 0 without writing a register is
+  indistinguishable from a real handback. The gate now runs **this
+  repository's** `bin/qnap-tsx70-fancontrol`, resolved from the script's own
+  location the way `install.sh` resolves it, and checks that `python3` can
+  actually execute it before anything is mutated. A verifier that is missing,
+  unreadable or unrunnable is no verdict, and no verdict removes nothing: the
+  installed binary and its unit stay where they are. A leftover fan unit with
+  no binary beside it used to be deleted with a warning that automatic mode had
+  never been confirmed; it is now gated like everything else, because a unit
+  file is a recovery mechanism too.
+- **A register write is believed only once the register reads back.**
+  `set_manual()` and `set_pwm()` trusted the return value of the sysfs write,
+  which says the driver took the bytes and nothing about what the chip did with
+  them. The failure that looks exactly like success — `pwmN_enable` answering
+  every command and staying on the chip's own automatic curve, or `pwmN`
+  holding the duty from the previous command — was invisible to all of it: a
+  calibration measured a fan at a duty it was never moved to, recorded the
+  stall point of a rung it never stood on, and then stepped *lower* from there;
+  a control loop drove a curve against a register that ignored it while the
+  per-register failure counter never moved; and the initial manual-mode
+  acquisition succeeded on a channel the program did not own. Both writes now
+  read the register back and require exactly the value asked for. A mismatch,
+  or a register that will not read at all, is counted as a failed write on that
+  channel and that register — so it aborts a sweep before the next, lower
+  command, and reaches the same three-strike threshold in the control loop even
+  when every other channel is answering. The comparison is exact: there is no
+  documented quantization in this driver, and a tolerance would forgive the
+  chip this is aimed at.
+- **A rollback undoes what the run changed, not everything it recorded.**
+  `txn_snapshot_all()` records every path the installer can touch — both
+  binaries, both units, the config, the modules file, the cache and the whole
+  legacy tree — on every run, and `rollback_touches_fan_artifacts()` read that
+  manifest. So a failed **LCD-only** install on a machine that happens to run
+  fan control was treated as a fan install: it stopped the fan service, scanned
+  for its processes, refused the whole rollback if one was found, ran
+  `safe-state` against a controller the run had never written to, replaced the
+  fan binary and unit with bytes identical to the ones already there, and
+  restarted the service afterwards. The transaction now tracks the paths and
+  units it actually wrote, replaced, deleted, stopped, started, enabled or
+  disabled, and only those put fan control in scope. An LCD-only, non-migrating
+  rollback stops no fan service, scans for no fan writer, runs no handback,
+  restores and removes no fan file — not even with identical bytes — and leaves
+  the unit's enablement and activity alone. A `--with-fan-control` replacement
+  and a migration deleting the legacy fan artifacts are both still fully gated.
+- **The lifecycle scripts hold the lock the fan writers take.** A stopped unit
+  and an empty process table describe one instant. Between that instant and the
+  `install` or the `rm` there is a verified handback, a display clear and a
+  `daemon-reload`, and a `systemctl start`, a boot-time activation or an
+  operator's `calibrate` landing in that gap is the live writer the check was
+  protecting against — now with its executable being replaced or deleted
+  underneath it. `scripts/install.sh`, its rollback and `scripts/uninstall.sh`
+  now take the canonical global writer lock once the fan units they own are
+  down, and hold it across the recheck, the handback and every replacement,
+  removal or restoration of a fan binary or unit. It is the same lock, not one
+  that resembles it: the new `scripts/qnap_lock.py` reads the path out of
+  `bin/qnap-tsx70-fancontrol` instead of defining one, and nothing on a command
+  line can move it. The hold ends at the last protected change and before
+  anything is started again, because what is started is a writer that has to
+  take the same lock; `safe-state` deliberately takes none, so the handback
+  still runs underneath it. An operation with no fan artifact in scope does not
+  take it at all. The lock lives on a file descriptor the shell owns, so every
+  exit releases it — including a `SIGKILL` no trap can run for — and there is
+  no lock file left claiming an owner that no longer exists.
+- **The closing summary reports the fan service that is actually running.** It
+  said "Fan control is installed but NOT running" unconditionally, including in
+  the case immediately above it in the script: a reinstall over a calibrated,
+  active fan service that the installer had just stopped to replace the binary
+  and `restore_fan_activity()` had just started again. It now inspects the
+  unit and distinguishes running, enabled-but-stopped and not-yet-calibrated,
+  without letting `systemctl`'s nonzero exits turn a finished install into a
+  failed one.
+
 ### Added
 
 - `scripts/uninstall.sh --fan-only`, which removes the fan binary, its unit
@@ -307,6 +388,11 @@ Three more paths where a guard was in place and something walked around it.
 - `scripts/redact.py`, the diagnostic redaction filter, and a fake-root test
   harness (`tests/fixtures.py`) that runs the installer and uninstaller for
   real against fake `systemctl`, `fuser` and `/proc`, without root or hardware.
+- `scripts/qnap_lock.py`, which lets the shell scripts hold the fan writers'
+  own lock. It reads the canonical path out of `bin/qnap-tsx70-fancontrol`
+  rather than defining one, and locks a descriptor the calling shell opened -
+  so the lock is released by closing a file, which every exit does, including
+  the ones no trap runs for. No dependency on util-linux's `flock(1)`.
 - `qnap-tsx70-lcd --print-config KEY` and
   `qnap-tsx70-fancontrol validate-cache`, both read-only.
 - `install.sh --allow-serial-owner PID`, for a port held by a process the
@@ -315,7 +401,7 @@ Three more paths where a guard was in place and something walked around it.
 
 ### Testing
 
-The suite is now **563 tests**, up from 234. The new ones execute the
+The suite is now **640 tests**, up from 234. The new ones execute the
 failure paths rather than searching the source for strings: stop failures, PID
 identity, fan-command classification against `run --sensor status` and its
 relatives, scope assertions for an active fan service during an LCD-only
@@ -361,12 +447,33 @@ writer survives it, the chip stays in manual mode, refuses the write, reads
 back nothing or is not there — each asserting the *contents* of the fan binary
 and unit file and the state of the unit, not only the command log.
 
+The sixth pass added 77 more, in four new files and three existing ones: a
+`pwmN_enable` and a `pwmN` that take a write and keep their contents, aimed at
+the manual-mode acquisition and at every phase of a sweep in turn - the
+spin-up, the descent, the zero, the restart search, the measured minimum and
+the cool-down - each proved to abort before the next, lower command; a
+two-channel control loop where one register answers every command and ignores
+it while the other works, proved to reach the threshold on its own; an
+installed fan binary that exits 0 having written no register, proved not to be
+run at all, let alone believed; a repository verifier that is missing,
+unreadable or not something `python3` can execute, each proved to remove
+nothing; the uninstaller resolved through a symlink from a different working
+directory; a failed LCD-only install on a machine running fan control, proved
+to leave the service active and enabled, its process unscanned, its controller
+unwritten and its binary and unit not merely byte-identical but not replaced at
+all; and a **real** `qnap-tsx70-fancontrol calibrate`, started in another
+process at the exact moment each lifecycle script holds the writer lock, proved
+to be refused - against the install, a migration, the rollback and the
+uninstall - with the lock proved acquirable again after a refusal and after a
+`SIGKILL` that ran no cleanup.
+
 Every safety guard added or changed here was mutation-tested: the production
 guard was removed or weakened one at a time and the run repeated to confirm
 that the test protecting it fails, and fails on its own assertion rather than
 on an error. 32 mutations were applied across the fourth pass's guards and all
-32 were caught; 22 across the fifth pass's, all 22 caught. No safety claim
-rests on a test that only greps a source file.
+32 were caught; 22 across the fifth pass's, all 22 caught; 25 across the sixth
+pass's, all 25 caught. No safety claim rests on a test that only greps a source
+file.
 
 **Still not run on physical TS-x70 hardware.** Everything above was validated
 offline.

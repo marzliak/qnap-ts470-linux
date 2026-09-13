@@ -165,6 +165,19 @@ still driving PWM leaves a process systemd no longer knows about and no
 executable left to restore the chip's automatic mode, and deleting them after
 an unconfirmed safe state leaves the chip in manual mode with the same result.
 
+The `safe-state` it runs is **this repository's** `bin/qnap-tsx70-fancontrol`,
+resolved from the uninstaller's own location — never the installed copy. The
+installed copy is the subject of the removal: it may be from an older release
+that verified less, or may have been replaced by something that exits 0 having
+written no register at all, and either way it would be authorising its own
+deletion. The uninstaller checks that the repository copy can actually be run
+before it changes anything, and a verifier that cannot run is treated as no
+verdict — so nothing is removed.
+
+It also holds the global writer lock from the point the fan unit is down until
+the last file is gone, so nothing can start a fan writer in the gap between the
+quiescence check and the `rm`.
+
 To remove fan control but keep the LCD, use `--fan-only`; see
 [§10](#10-uninstalling-just-fan-control).
 
@@ -293,6 +306,26 @@ never looked at — while the calibration sweep was deliberately driving a fan
 towards its stall point. The first lock is what a writer that cannot resolve a
 controller takes on its own, so it can never race one that can.
 
+`scripts/install.sh`, its rollback and `scripts/uninstall.sh` take the global
+lock too, through `scripts/qnap_lock.py` — which reads the path out of
+`bin/qnap-tsx70-fancontrol` rather than defining one of its own, so there is a
+single definition of it in the repository. They hold it from the moment the
+fan units they own are down, across the "no fan writer remains" recheck, the
+verified handback, and every replacement or removal of a fan binary or unit.
+
+That is what makes the recheck worth more than the instant it runs in. Without
+it, a `systemctl start qnap-tsx70-fancontrol`, a boot-time activation or an
+operator's `calibrate` landing between the check and the `rm` is a live writer
+whose executable is being deleted underneath it. The hold ends at the last
+protected change and before anything is started again, because what is started
+is a writer that has to take the same lock.
+
+An operation with no fan artifact in scope — the ordinary LCD-only install,
+an uninstall on a machine with no fan control — does not take the lock at all.
+And because the lock lives on a file descriptor the shell owns, every exit
+releases it, including a `SIGKILL` no trap can run for: there is no lock file
+left claiming an owner that no longer exists.
+
 ---
 
 ## 6. Calibration hazard
@@ -320,10 +353,11 @@ stops, then raises it again until it starts. During that window the machine has
 | Thermal abort | Aborts and fails safe at 70 °C during the sweep |
 | Lost telemetry | Every settle sample is validated; a missing, unparseable, NaN, infinite or out-of-band reading aborts the sweep immediately, before the duty is lowered again |
 | Refused control write | Every control write is a gate: manual mode, the spin-up, each step of the descent, the zero duty, each step of the restart search, the measured minimum and the cool-down. The first one the chip does not acknowledge aborts the sweep, because the next step is always *lower* and taking it would be stepping the fan towards its stall point without knowing what duty it is on. Nothing is analysed and nothing is saved |
+| Ignored control write | A write that returns success proves the driver took the bytes and nothing about what the chip did with them. Every mode and duty write is read back and must equal exactly the value asked for; a mismatch, or a register that will not read at all, is counted as a failed write on that channel and register. In a sweep that aborts it before the next, lower command; in the control loop it reaches the same three-strike threshold, so one permanently ignored register fails safe while every other channel keeps answering |
 | Stall cap | Aborts if a fan sits at 0 RPM longer than 45 s |
 | `--probe` | Spinning a silent channel up is a register write like any other, so it happens inside the same cleanup scope as the sweep. Every channel the probe touched is handed back and read back, including one it decided has no fan on it; a probe that cannot be undone exits nonzero, saves nothing and recommends nothing |
 | Signals | `SIGTERM`, `SIGINT` (Ctrl-C), `SIGHUP` (SSH disconnect) and `SIGQUIT` all fail safe |
-| Lock | An interactive calibration and the service cannot run at once, whatever `--cache` each was given: the lock names the controller, not the file |
+| Lock | An interactive calibration and the service cannot run at once, whatever `--cache` each was given: the lock names the controller, not the file. `scripts/install.sh` and `scripts/uninstall.sh` hold the same global lock while they replace or delete a fan binary or unit, so neither can start in that window either |
 | Degenerate results | A sweep on a fan that never turned is discarded, not saved |
 | Exit path | Success, failure, exception and signal all force full duty plus automatic mode, then read the register back to confirm. A restore that cannot be confirmed exits nonzero and the calibration is not saved |
 
@@ -432,12 +466,19 @@ Nothing is deleted until all of these hold:
    `activating` and `deactivating` count as active, not as stopped;
 2. no fan-control process is left, judged by the command word in its argv, so
    `run --sensor status` is a writer and a stray `status` is not;
-3. `qnap-tsx70-fancontrol safe-state` exited 0, which it does only when every
-   controllable channel reads back as automatic mode.
+3. this repository's `bin/qnap-tsx70-fancontrol safe-state` exited 0, which it
+   does only when every controllable channel reads back as automatic mode. The
+   repository copy, not the installed one: what is being deleted does not get
+   a vote on the deletion.
+
+All three run while the uninstaller holds the global fan writer lock, so a
+writer cannot start between them and the first `rm`.
 
 If any of them fails the run stops, the binary and the unit stay where they
 are, and you are told how to recover. That is the point of them: those two
-files are the only way back once they are gone.
+files are the only way back once they are gone. A repository verifier that
+cannot be run at all — missing, unreadable, or not something `python3` can
+execute — counts as a failure for the same reason.
 
 `scripts/install.sh` applies the same third rule to itself. Before it replaces
 the fan binary and unit (`--with-fan-control` over an existing install) or

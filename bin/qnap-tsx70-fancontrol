@@ -41,6 +41,13 @@ Safety model (docs/FAN_CONTROL.md has the full discussion):
     may sit stopped, and treats every one of its own control writes as a hard
     gate: a duty the chip did not acknowledge aborts the sweep instead of
     being followed by a lower one;
+  * a mode or duty write is only believed once the register reads back as
+    exactly the value that was asked for. A sysfs write returning success says
+    the driver took the bytes and nothing about what the chip did with them,
+    and the one failure that looks like everything working is the register
+    that answers every command and keeps its old contents. An unverified
+    readback is counted as a failed write, so it reaches the same per-register
+    threshold and aborts the same sweeps;
   * a duty floor stops a corrupt or hand-edited calibration from pinning a fan
     off with no way to restart it;
   * losing the temperature input escalates to full speed and then exits
@@ -606,31 +613,83 @@ class FanController:
                       for (channel, register), count
                       in self._write_failures.items() if count >= limit)
 
+    def _commit_write(self, channel, register, expected, wrote):
+        """Record one register write, believing the readback and not the write.
+
+        A sysfs write that returns success has proven that the driver took the
+        bytes, and nothing else. The registers this program drives are the
+        ones a fan is parked on, and a write the chip quietly ignores is the
+        failure mode that looks exactly like everything working: `pwmN_enable`
+        keeps reading 2 while a curve is driven against it, or `pwmN` keeps
+        the duty from the previous command while a sweep steps down towards a
+        stall point it has already passed.
+
+        So the readback is the verdict, not the return value of the write. A
+        mismatch - or a register that will not read at all, which is the same
+        chip saying less - is counted as a failed write on that channel and
+        that register rather than as a separate kind of event. That is what
+        makes one permanently ignored register reach WRITE_FAILURE_LIMIT on
+        its own while every other channel keeps answering: see _record_write.
+
+        The comparison is exact. Nothing in this driver's behaviour says a
+        written duty comes back rounded or quantized, and a tolerance invented
+        here would forgive precisely the chip this exists to catch. If
+        evidence for quantization ever turns up, it belongs in the protocol
+        documentation first and in a named constant second - not in a
+        `abs(a - b) <= n` nobody can date.
+        """
+        if not wrote:
+            return self._record_write(channel, register, False)
+        actual = read_int(self._path(register))
+        if actual == expected:
+            return self._record_write(channel, register, True)
+        log("ALERT channel %d: %s took the write and did not take the value - "
+            "asked for %s, reads back as %s. Counted as a failed write."
+            % (channel, register, expected,
+               "nothing" if actual is None else actual))
+        return self._record_write(channel, register, False)
+
     def set_manual(self, channel):
+        """Put one channel under this program's duty register, and prove it.
+
+        True only when `pwmN_enable` reads back as PWM_MANUAL afterwards. A
+        chip that accepts the mode write and stays on its own automatic curve
+        makes every duty written next a suggestion and every RPM read back a
+        description of the chip's decisions, which is why this is the one
+        place the distinction has to be made rather than deferred.
+        """
         self.remember(channel)
         if self.dry_run:
             return True
         register = "pwm%d_enable" % channel
         ok = write_sysfs(self._path(register), PWM_MANUAL)
         time.sleep(0.2)
-        return self._record_write(channel, register, ok)
+        return self._commit_write(channel, register, PWM_MANUAL, ok)
 
     def set_auto(self, channel):
         if self.dry_run:
             return True
         register = "pwm%d_enable" % channel
-        return self._record_write(
-            channel, register,
+        return self._commit_write(
+            channel, register, PWM_AUTOMATIC,
             write_sysfs(self._path(register), PWM_AUTOMATIC))
 
     def set_pwm(self, channel, value):
+        """Command one duty, and prove the register took it.
+
+        True only when `pwmN` reads back as exactly the clamped value that was
+        asked for. The clamp is applied before the comparison for the same
+        reason it is applied before the write: 9999 is a command for 255, and
+        255 is what the register is then required to hold.
+        """
         self.remember(channel)
         if self.dry_run:
             return True
         register = "pwm%d" % channel
-        return self._record_write(
-            channel, register,
-            write_sysfs(self._path(register), clamp_pwm(value)))
+        target = clamp_pwm(value)
+        return self._commit_write(
+            channel, register, target,
+            write_sysfs(self._path(register), target))
 
     def restore(self, channel):
         """Return one channel to exactly the state observed before this run.
@@ -1119,16 +1178,23 @@ def command_manual(controller, channel):
     curve, so every duty written afterwards is a suggestion, every RPM read
     back describes the chip's decisions rather than this program's, and the
     numbers that come out the other end are a measurement of nothing.
+
+    "Did not accept" includes the chip that answers the write and keeps its
+    old mode: set_manual() reads `pwmN_enable` back and requires PWM_MANUAL
+    exactly, so a silently ignored mode write ends the sweep here rather than
+    producing a calibration of the chip's own curve.
     """
     if controller.set_manual(channel):
         return
     raise FanError(
-        "aborting calibration: channel %d did not accept the manual-mode "
-        "command. Nothing was measured and nothing was saved." % channel)
+        "aborting calibration: channel %d is not in manual mode - the "
+        "manual-mode command was refused, or it was accepted and "
+        "pwm%d_enable did not read back as %d. Nothing was measured and "
+        "nothing was saved." % (channel, channel, PWM_MANUAL))
 
 
 def command_duty(controller, channel, duty, what):
-    """Command one calibration duty, or abort.
+    """Command one calibration duty, prove the register took it, or abort.
 
     In the control loop a refused write is a retry-next-cycle event: the fan
     stays where it is, which is somewhere it was already running. In a
@@ -1136,13 +1202,21 @@ def command_duty(controller, channel, duty, what):
     means stepping a fan towards its stall point without knowing what duty it
     is actually on. There is no safe way to do that, so the first refusal
     ends the sweep and the caller hands the fans back.
+
+    A write the chip took and ignored is the same situation and used to be
+    invisible: `pwmN` kept the previous duty, the settle measured the fan at
+    that duty, and the sweep stepped down again from a rung it had never
+    actually stood on. set_pwm() reads the register back and requires the
+    exact commanded value, so that case arrives here too - before the next,
+    lower command is written.
     """
     if controller.set_pwm(channel, duty):
         return
     raise FanError(
-        "aborting calibration: channel %d did not accept the %s duty %d. The "
-        "chip is not acknowledging commands, so the fan's real duty is "
-        "unknown and the sweep will not step down blind." % (channel, what, duty))
+        "aborting calibration: channel %d is not at the %s duty %d - the "
+        "write was refused, or it was accepted and pwm%d did not read back "
+        "as %d. The fan's real duty is unknown and the sweep will not step "
+        "down blind." % (channel, what, duty, channel, clamp_pwm(duty)))
 
 
 def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
@@ -1414,12 +1488,19 @@ def cmd_run(args):
         # three are remembered for the safe state. Entering the loop without
         # checking meant a channel still on the chip's own automatic curve was
         # driven for the rest of the run as though this program owned it.
+        # set_manual() is positive readback or nothing: the mode register has
+        # to come back reading PWM_MANUAL, not merely accept the write. A chip
+        # that takes the command and stays on its own curve is the case this
+        # loop must never enter, because every duty it writes afterwards is a
+        # suggestion and every RPM it reads back is the chip's own answer.
         refused = [c for c in channels if not controller.set_manual(c)]
         if refused:
             raise FanError(
-                "channels %s did not accept the manual-mode command, so this "
-                "program is not in control of them; refusing to run a curve "
-                "against registers the chip is ignoring" % refused)
+                "channels %s are not in manual mode - the command was refused, "
+                "or it was accepted and pwmN_enable did not read back as %d. "
+                "This program is not in control of them; refusing to run a "
+                "curve against registers the chip is ignoring"
+                % (refused, PWM_MANUAL))
 
         while True:
             temp = read_temp(temp_path)

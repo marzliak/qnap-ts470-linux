@@ -25,6 +25,7 @@ REQUIRED_FILES = [
     "scripts/uninstall.sh",
     "scripts/diagnose.sh",
     "scripts/redact.py",
+    "scripts/qnap_lock.py",
     "docs/LCD_GUIDE.md",
     "docs/LCD_PROTOCOL.md",
     "docs/FAN_CONTROL.md",

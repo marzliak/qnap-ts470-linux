@@ -637,6 +637,98 @@ class FanEnablementTests(InstallerCase):
             unit)
 
 
+class FinalStatusTests(InstallerCase):
+    """The closing summary describes this machine, not a default install.
+
+    The line used to be an unconditional "Fan control is installed but NOT
+    running", printed even in the one case directly above it in the script: a
+    reinstall over a calibrated, active fan service, which the installer had
+    just stopped to replace the binary and restore_fan_activity() had just
+    started again. Telling that operator their fans are unmanaged is worse
+    than saying nothing - it is the sentence that sends them to start a second
+    writer by hand.
+    """
+
+    def running_fan_install(self):
+        fixture = self.fixture
+        fixture.with_config()
+        fixture.write(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"),
+                      "#!/bin/sh\necho previous\n", 0o755)
+        fixture.add_unit("qnap-tsx70-fancontrol.service", active=True,
+                         enabled=True)
+        fixture.write(os.path.join(fixture.state_dir,
+                                   "fan-calibration.json"), VALID_CACHE)
+        return fixture
+
+    def test_a_restarted_fan_service_is_reported_as_running(self):
+        fixture = self.running_fan_install()
+
+        result = fixture.install("--skip-deps", "--with-fan-control")
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("restart qnap-tsx70-fancontrol.service", fixture.calls(),
+                      "the service that was active before was not restarted")
+        self.assertTrue(fixture.unit_state(
+            "qnap-tsx70-fancontrol.service")["active"])
+        self.assertIn("installed and RUNNING", output)
+        self.assertNotIn("installed but NOT running", output)
+        self.assertNotIn("calibrate --yes", output,
+                         "a running, calibrated service was told to calibrate")
+
+    def test_a_fresh_install_still_says_it_is_not_running(self):
+        # The control, and the common case: nothing was calibrated, nothing
+        # was started, and the summary has to keep saying so.
+        self.fixture.with_config()
+
+        result = self.fixture.install("--skip-deps", "--with-fan-control")
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("installed but NOT running", output)
+        self.assertNotIn("installed and RUNNING", output)
+        self.assertIn("calibrate --yes", output)
+
+    def test_an_enabled_but_stopped_service_is_told_how_to_start(self):
+        # Enabled because the cache validates, not started because a first
+        # start is something to watch. "Calibrate first" would be wrong here.
+        self.fixture.with_config()
+        self.fixture.write(os.path.join(self.fixture.state_dir,
+                                        "fan-calibration.json"), VALID_CACHE)
+
+        result = self.fixture.install("--skip-deps", "--with-fan-control")
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("installed but NOT running", output)
+        self.assertIn("start at the next boot", output)
+        self.assertIn("systemctl start qnap-tsx70-fancontrol", output)
+        self.assertNotIn("calibrate --yes", output)
+
+    def test_the_summary_never_turns_a_finished_install_into_a_failure(self):
+        # `systemctl is-enabled` exits 1 for a disabled unit and `is-active`
+        # exits 3 for an inactive one. Under `set -e`, with the ERR trap still
+        # armed at that point in an earlier shape of this, either would have
+        # rolled back a completed install.
+        self.fixture.with_config()
+
+        result = self.fixture.install("--skip-deps", "--with-fan-control")
+
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + "\n" + result.stderr)
+        self.assertIn("==> Done", result.stdout)
+        self.assertNotIn("rolling back", result.stderr)
+
+    def test_an_lcd_only_install_says_nothing_about_fan_control(self):
+        self.fixture.with_config()
+
+        result = self.fixture.install("--skip-deps")
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertNotIn("Fan control is installed", output)
+
+
 if __name__ == "__main__":
     unittest.main()
 
