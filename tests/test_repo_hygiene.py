@@ -24,6 +24,7 @@ REQUIRED_FILES = [
     "scripts/install.sh",
     "scripts/uninstall.sh",
     "scripts/diagnose.sh",
+    "scripts/redact.py",
     "docs/LCD_GUIDE.md",
     "docs/LCD_PROTOCOL.md",
     "docs/FAN_CONTROL.md",
@@ -40,6 +41,9 @@ LEGACY_ALLOWED = {
     "scripts/install.sh",             # must detect and migrate legacy artifacts
     "scripts/diagnose.sh",            # reports a half-migrated system
     "tests/test_repo_hygiene.py",     # states the rule
+    "tests/fixtures.py",              # builds legacy installations to test on
+    "tests/test_install_safety.py",   # exercises the migration
+    "tests/test_docs_rollback.py",    # executes the documented rollback
 }
 
 # A link to the migration document is not itself a legacy reference.
@@ -168,9 +172,17 @@ class PrivacyTests(unittest.TestCase):
     # RFC 5737 documentation addresses only; no real address appears anywhere.
     ALLOWED_LITERALS = ("192.0.2.1", "192.0.2.10", "0.0.0.0")
 
+    # The redactor's own corpus. Its whole job is to contain the shapes this
+    # scanner looks for, so scanning it would only ever find its fixtures.
+    # Everything in it is a documentation-range or plainly synthetic value,
+    # which is what makes it usable as a fixture in the first place.
+    FIXTURE_FILES = ("tests/test_redaction.py",)
+
     def test_no_identifying_values_in_tracked_files(self):
         findings = []
         for path, body in text_files():
+            if path in self.FIXTURE_FILES:
+                continue
             for line_number, line in enumerate(body.splitlines(), 1):
                 if any(literal in line for literal in self.ALLOWED_LITERALS):
                     continue
@@ -186,7 +198,9 @@ class PrivacyTests(unittest.TestCase):
         # anything labelled as a serial is not.
         pattern = re.compile(r"serial\s*(?:number|no\.?|#)\s*[:=]\s*\S+", re.I)
         for path, body in text_files():
-            if path in ("scripts/diagnose.sh", "tests/test_repo_hygiene.py"):
+            if path in (("scripts/diagnose.sh", "scripts/redact.py",
+                         "tests/test_repo_hygiene.py")
+                        + self.FIXTURE_FILES):
                 continue
             self.assertIsNone(pattern.search(body),
                               "%s appears to publish a serial number" % path)

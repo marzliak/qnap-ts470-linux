@@ -10,10 +10,20 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
 CONF_FILE="${QNAP_TSX70_CONF:-/etc/qnap-tsx70-lcd.conf}"
 STATE_DIR="/var/lib/qnap-tsx70"
+# The redactor is a separate Python filter because compressed IPv6 addresses
+# cannot be told apart from ordinary colon-separated text by a regex alone.
+# Overridable so the regression suite can prove that a failing redactor makes
+# this script fail rather than emit an unredacted bundle.
+REDACTOR="${QNAP_TSX70_REDACT:-$SCRIPT_DIR/redact.py}"
 OUTPUT=""
 WITH_SMART=0
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'USAGE'
@@ -31,37 +41,41 @@ USAGE
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        -o|--output) OUTPUT="${2:-}"; shift ;;
+        -o|--output)
+            # An unconsumed `-o` used to leave OUTPUT empty and silently print
+            # the bundle to stdout instead.
+            [ $# -ge 2 ] || { usage >&2; die "$1 requires a file argument"; }
+            case "$2" in
+                "") usage >&2; die "$1 requires a non-empty file argument" ;;
+                -*) usage >&2; die "$1 requires a file argument, got: $2" ;;
+            esac
+            OUTPUT="$2"
+            shift ;;
+        --output=*)
+            OUTPUT="${1#*=}"
+            [ -n "$OUTPUT" ] || { usage >&2; die "--output requires a file argument"; } ;;
         --with-smart) WITH_SMART=1 ;;
         -h|--help) usage; exit 0 ;;
-        *) usage >&2; exit 1 ;;
+        *) usage >&2; die "unknown option: $1" ;;
     esac
     shift
 done
 
+[ -f "$REDACTOR" ] || die "redaction filter not found at $REDACTOR; refusing to \
+produce an unredacted bundle"
+command -v python3 >/dev/null 2>&1 || die "python3 is required to redact the bundle"
+
 HOSTNAME_RAW="$(hostname 2>/dev/null || echo '')"
 HOSTNAME_SHORT="${HOSTNAME_RAW%%.*}"
 
-# redact - filter stdin, removing identifying values.
+# redact - filter stdin through the tested Python redactor.
 redact() {
-    local script=''
-    if [ -n "$HOSTNAME_SHORT" ]; then
-        local escaped
-        escaped="$(printf '%s' "$HOSTNAME_SHORT" | sed 's/[][\.*^$/&]/\\&/g')"
-        # Word-anchored: a short hostname must not be substituted inside an
-        # unrelated identifier such as a board model number.
-        script+="s/\\b${escaped}\\b/[hostname]/Ig;"
+    local args=()
+    [ -n "$HOSTNAME_SHORT" ] && args+=(--hostname "$HOSTNAME_SHORT")
+    if [ -n "$HOSTNAME_RAW" ] && [ "$HOSTNAME_RAW" != "$HOSTNAME_SHORT" ]; then
+        args+=(--hostname "$HOSTNAME_RAW")
     fi
-    sed -E "
-        ${script}
-        s/\b([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b/[mac]/g;
-        s/\b([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?\b/[ip]/g;
-        s/\b([0-9a-fA-F]{4}:){2,7}[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4})*\b/[ipv6]/g;
-        s/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/[uuid]/Ig;
-        s/^(.*([Ss]erial [Nn]umber|SERIAL|[Ss]erial#|LU WWN|WWN|IEEE EUI-64|[Ww]orld [Ww]ide [Nn]ame).*)$/[serial removed]/;
-        s/\"serial_number\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"serial_number\": \"[serial removed]\"/g;
-        s/(PARTUUID|UUID|ID_SERIAL|WWN)=[^[:space:]\"]*/\1=[redacted]/Ig;
-    "
+    python3 "$REDACTOR" ${args[@]+"${args[@]}"}
 }
 
 section() { printf '\n===== %s =====\n' "$1"; }
@@ -109,19 +123,27 @@ collect() {
 
     section "Serial ports"
     ls -l /dev/ttyS* 2>/dev/null || printf 'no /dev/ttyS* devices\n'
-    local port
+    # Asking the binary keeps this agreeing with the runtime about quoting,
+    # inline comments and duplicate keys instead of re-parsing the file here.
+    local port lcd
     port=""
-    if [ -r "$CONF_FILE" ]; then
-        port="$(sed -n 's/^[[:space:]]*serial_port[[:space:]]*=[[:space:]]*//p' "$CONF_FILE" | tail -1)" || port=""
-    fi
-    port="${port:-/dev/ttyS1}"
-    printf '\nconfigured port: %s\n' "$port"
-    if [ -c "$port" ]; then
-        printf 'exists: yes\n'
-        have fuser && printf 'in use by: %s\n' "$(fuser "$port" 2>/dev/null || echo 'nothing')"
-        have stty && printf 'stty: %s\n' "$(stty -F "$port" -a 2>&1 | head -1)"
+    for lcd in /usr/local/bin/qnap-tsx70-lcd "$REPO_ROOT/bin/qnap-tsx70-lcd"; do
+        [ -f "$lcd" ] || continue
+        port="$(python3 "$lcd" --config "$CONF_FILE" --print-config serial_port \
+                2>/dev/null)" && [ -n "$port" ] && break
+        port=""
+    done
+    if [ -z "$port" ]; then
+        printf '\nconfigured port: unreadable (see the Configuration section)\n'
     else
-        printf 'exists: no\n'
+        printf '\nconfigured port: %s\n' "$port"
+        if [ -c "$port" ]; then
+            printf 'exists: yes\n'
+            have fuser && printf 'in use by: %s\n' "$(fuser "$port" 2>/dev/null || echo 'nothing')"
+            have stty && printf 'stty: %s\n' "$(stty -F "$port" -a 2>&1 | head -1)"
+        else
+            printf 'exists: no\n'
+        fi
     fi
 
     section "hwmon sensors"
@@ -201,11 +223,31 @@ collect() {
     printf '\n===== end of bundle =====\n'
 }
 
-if [ -n "$OUTPUT" ]; then
-    collect 2>&1 | redact > "$OUTPUT"
-    chmod 0600 "$OUTPUT" 2>/dev/null || true
-    printf 'Wrote redacted bundle to %s\n' "$OUTPUT" >&2
-    printf 'Review it before attaching it to an issue.\n' >&2
-else
+if [ -z "$OUTPUT" ]; then
     collect 2>&1 | redact
+    exit $?
 fi
+
+# Writing to a file is a transaction: a temporary file next to the target, a
+# collection and a redaction that both have to succeed, mode 0600, and only
+# then an atomic rename. Success is announced after the file exists, never
+# before - the old order could print "Wrote..." and exit zero having written
+# nothing at all.
+[ -d "$OUTPUT" ] && die "output path is a directory: $OUTPUT"
+OUT_DIR="$(dirname -- "$OUTPUT")"
+[ -d "$OUT_DIR" ] || die "output directory does not exist: $OUT_DIR"
+
+TMP_OUT="$(mktemp -- "$OUT_DIR/.qnap-tsx70-diagnose.XXXXXX" 2>/dev/null)" \
+    || die "cannot create a temporary file in $OUT_DIR"
+cleanup_tmp() { [ -n "${TMP_OUT:-}" ] && rm -f -- "$TMP_OUT"; }
+trap 'cleanup_tmp' EXIT HUP INT TERM
+
+collect 2>&1 | redact > "$TMP_OUT" \
+    || die "collection or redaction failed; $OUTPUT was not written"
+chmod 0600 -- "$TMP_OUT" || die "cannot set mode 0600 on the bundle"
+mv -f -- "$TMP_OUT" "$OUTPUT" || die "cannot move the bundle into place: $OUTPUT"
+TMP_OUT=""
+trap - EXIT HUP INT TERM
+
+printf 'Wrote redacted bundle to %s\n' "$OUTPUT" >&2
+printf 'Review it before attaching it to an issue.\n' >&2

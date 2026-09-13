@@ -65,26 +65,49 @@ sudo ./scripts/install.sh --dry-run
 ### What the installer does, in order
 
 1. **Preflight.** Verifies the repository files, `python3`, systemd, the serial
-   port, and — for fan control — that exactly one fan controller is present.
-   Nothing has been modified at this point; a failure here aborts cleanly.
-2. **Backup.** Copies legacy units, binaries, the calibration cache and any
-   existing config to `/var/backups/qnap-tsx70/<timestamp>/`, and records which
-   legacy units were enabled.
-3. **Stop legacy services.** Fan control is stopped first, so its own shutdown
-   handler hands the fans back to the controller's automatic mode before
-   anything else moves.
-4. **Migrate the cache.** The legacy cache is parsed as JSON and only then
-   copied to the new location. An unparseable cache is left alone and reported.
+   port and — for fan control — that exactly one fan controller is present. It
+   also identifies which process holds the serial port. A port held by
+   `saturn-lcd` or by an already-running `qnap-tsx70-lcd` is the normal case
+   and is allowed; a port held by anything else stops the install. Nothing has
+   been modified at this point.
+2. **Record the current state.** Before the first change, the installer writes
+   a transaction manifest under
+   `/var/backups/qnap-tsx70/<timestamp>-<pid>/txn/`: for every path it can
+   touch, whether it existed, its mode and a byte copy of its content; and for
+   every unit, whether systemd had it enabled and active. Alongside it, a
+   human-readable backup is laid out by kind — `bin/`, `systemd/`, `state/`
+   and `config/` — plus an `enabled-units` list.
+3. **Stop services for the transition.** Fan control first, so its own
+   shutdown handler hands the fans back to the controller's automatic mode.
+   Each stop is verified: systemd must report the unit inactive and no known
+   fan-control process may remain. A legacy `/run/saturn-fancontrol.pid` is
+   validated against the process it names before anything is signalled. The
+   LCD services are stopped next, and the serial port is confirmed released.
+4. **Migrate the cache.** The legacy cache is validated by the fan binary
+   itself and only then copied to the new location. A cache that does not
+   validate is **left exactly where it is** and reported; it is not deleted
+   later either.
 5. **Install.** Binaries, unit files and the config are copied from the
    versioned files in the repository.
 6. **Enable and start.** The LCD service is enabled and started. Fan control,
-   if requested, is enabled but **not** started.
+   if requested, is installed, and it is enabled **only** when a valid
+   calibration cache is already present — otherwise the unit stays disabled
+   and the installer prints the calibrate-then-enable sequence.
 7. **Validate.** Confirms the LCD service is active and runs its preflight.
-8. **Remove legacy artifacts** — only after validation passes.
+8. **Remove legacy artifacts** — only after validation passes, and only after
+   re-confirming no fan-control process is running.
+9. **Post-cleanup validation.** Confirms the new service is still active and
+   the legacy units are gone.
 
-If any step between 5 and 7 fails, the installer rolls back automatically:
-legacy units and binaries are restored from the backup, the new units are
-removed, and whatever was enabled before is enabled and started again.
+A failure in **any** step from 3 onwards — including during legacy cleanup or
+post-cleanup validation — rolls the whole thing back from the manifest: every
+recorded path is restored to its previous content and mode, paths this run
+created are removed, paths that already existed are put back rather than
+deleted, and every unit is returned to the enablement and activity it had
+before. The backup and the manifest are kept, and their paths are printed.
+
+`--dry-run` performs none of this. It prints what each step would do,
+including what a rollback would restore, and changes nothing at all.
 
 ### An existing config is never overwritten
 
@@ -99,38 +122,64 @@ two after upgrading.
 If you prefer to do it yourself, or the automatic path failed:
 
 ```bash
-# 1. Stop fan control first, then the display.
-sudo systemctl disable --now saturn-fancontrol.service 2>/dev/null || true
-sudo systemctl disable --now saturn-lcd.service
+# 1. Stop every fan writer first, then the display. Both legacy fan unit
+#    names are recognised by the installer, so both have to be handled here.
+for unit in saturn-fancontrol.service saturn-fan.service; do
+    sudo systemctl disable --now "$unit" 2>/dev/null || true
+done
+sudo systemctl disable --now saturn-lcd.service 2>/dev/null || true
 
-# 2. Back everything up.
-sudo mkdir -p /var/backups/qnap-tsx70/manual
+# 2. Verify all three really stopped. Do not continue while any is active.
+for unit in saturn-fancontrol.service saturn-fan.service saturn-lcd.service; do
+    printf '%s: %s\n' "$unit" "$(systemctl is-active "$unit" 2>&1)"
+done   # expect: inactive, failed or unknown for all three
+
+# 3. Verify no fan process survived its unit, and that the serial port is
+#    free. A process still writing PWM must be stopped before you continue.
+pgrep -a -f 'saturn-fan' || echo 'no legacy fan process'
+sudo fuser /dev/ttyS1 || echo 'serial port free'
+
+# 4. If /run/saturn-fancontrol.pid exists, check what it names before acting.
+#    Do not signal the PID unless it really is the legacy fan controller.
+pid="$(cat /run/saturn-fancontrol.pid 2>/dev/null)"
+[ -n "$pid" ] && sudo readlink -f "/proc/$pid/exe" 2>/dev/null
+
+# 5. Back everything up, one directory per kind so a restore can be precise.
+sudo mkdir -p /var/backups/qnap-tsx70/manual/{bin,systemd,state}
 sudo cp -a /etc/systemd/system/saturn-*.service \
-           /usr/local/bin/saturn-* \
-           /etc/saturn-fan-cache.json \
-           /var/backups/qnap-tsx70/manual/ 2>/dev/null || true
+           /var/backups/qnap-tsx70/manual/systemd/ 2>/dev/null || true
+for binary in saturn-lcd saturn-fan-calibrate saturn-fancontrol saturn-fan; do
+    [ -f "/usr/local/bin/$binary" ] \
+        && sudo cp -a "/usr/local/bin/$binary" \
+                      /var/backups/qnap-tsx70/manual/bin/
+done
+sudo cp -a /etc/saturn-fan-cache.json \
+           /var/backups/qnap-tsx70/manual/state/ 2>/dev/null || true
 
-# 3. Move the calibration cache, after checking it is valid JSON.
+# 6. Move the calibration cache, but only if the fan binary accepts it.
 sudo mkdir -p /var/lib/qnap-tsx70
-python3 -c 'import json,sys; json.load(open(sys.argv[1]))' /etc/saturn-fan-cache.json \
+python3 bin/qnap-tsx70-fancontrol validate-cache \
+        --cache /etc/saturn-fan-cache.json \
   && sudo install -m 0644 /etc/saturn-fan-cache.json \
        /var/lib/qnap-tsx70/fan-calibration.json
+# If it does not validate, keep it where it is. Do not delete it in step 8.
 
-# 4. Install the new files from the repository.
+# 7. Install the new files from the repository.
 sudo install -m 0755 bin/qnap-tsx70-lcd /usr/local/bin/qnap-tsx70-lcd
 sudo install -m 0644 config/qnap-tsx70-lcd.conf.example /etc/qnap-tsx70-lcd.conf
 sudo install -m 0644 systemd/qnap-tsx70-lcd.service /etc/systemd/system/
-
-# 5. Start and verify.
 sudo systemctl daemon-reload
 sudo systemctl enable --now qnap-tsx70-lcd
 systemctl is-active qnap-tsx70-lcd
 sudo qnap-tsx70-lcd --check
 
-# 6. Only once that works, remove the legacy files.
+# 8. Only once that works, remove the legacy files. The cache line belongs
+#    here only if step 6 actually migrated it.
 sudo rm -f /etc/systemd/system/saturn-*.service \
            /usr/local/bin/saturn-lcd \
            /usr/local/bin/saturn-fan-calibrate \
+           /usr/local/bin/saturn-fancontrol \
+           /usr/local/bin/saturn-fan \
            /etc/saturn-fan-cache.json \
            /run/saturn-fancontrol.pid
 sudo systemctl daemon-reload
@@ -147,21 +196,34 @@ For fan control, additionally install `bin/qnap-tsx70-fancontrol` and
 The automatic rollback runs by itself on a failed install. To go back
 deliberately afterwards, use the backup directory the installer reported:
 
+The backup is laid out by kind, so each destination gets only what belongs
+there. A flat `cp "$BACKUP"/saturn-* /usr/local/bin/` would also copy unit
+files and the cache into the binary directory.
+
 ```bash
-BACKUP=/var/backups/qnap-tsx70/<timestamp>
+BACKUP=/var/backups/qnap-tsx70/<timestamp>-<pid>
 
 sudo systemctl disable --now qnap-tsx70-lcd qnap-tsx70-fancontrol 2>/dev/null || true
 sudo rm -f /etc/systemd/system/qnap-tsx70-*.service
-sudo rm -f /usr/local/bin/qnap-tsx70-*
+sudo rm -f /usr/local/bin/qnap-tsx70-lcd /usr/local/bin/qnap-tsx70-fancontrol
 
-sudo cp -a "$BACKUP"/saturn-*.service /etc/systemd/system/ 2>/dev/null || true
-sudo cp -a "$BACKUP"/saturn-* /usr/local/bin/ 2>/dev/null || true
-sudo cp -a "$BACKUP"/saturn-fan-cache.json /etc/ 2>/dev/null || true
+# Units, binaries and state each come from their own directory.
+sudo cp -a "$BACKUP"/systemd/saturn-*.service /etc/systemd/system/ 2>/dev/null || true
+for binary in saturn-lcd saturn-fan-calibrate saturn-fancontrol saturn-fan; do
+    [ -f "$BACKUP/bin/$binary" ] \
+        && sudo cp -a "$BACKUP/bin/$binary" "/usr/local/bin/$binary"
+done
+sudo cp -a "$BACKUP"/state/saturn-fan-cache.json /etc/ 2>/dev/null || true
 
 sudo systemctl daemon-reload
 # Re-enable whatever was enabled before; the list is in "$BACKUP/enabled-units".
 cat "$BACKUP/enabled-units"
 ```
+
+The exact prior state — including the mode of each file and which units were
+active as well as enabled — is recorded in `"$BACKUP"/txn/manifest.tsv` and
+`"$BACKUP"/txn/units.tsv`, with the original bytes under `"$BACKUP"/txn/files/`.
+That is what the installer's own automatic rollback replays.
 
 Note that the legacy fan-control service had the defects described above,
 including never entering its control loop. Rolling back restores that
@@ -176,9 +238,11 @@ systemctl is-active qnap-tsx70-lcd          # expect: active
 sudo qnap-tsx70-lcd --check                 # expect: all ok, or explained warnings
 journalctl -u qnap-tsx70-lcd -n 30
 
-# Nothing legacy should remain:
+# Nothing legacy should remain, with one documented exception: a calibration
+# cache that did not validate is deliberately kept at its original path.
 ls /etc/systemd/system/saturn-* /usr/local/bin/saturn-* /etc/saturn-fan-cache.json 2>&1
-# expect: No such file or directory
+# expect: No such file or directory, unless the installer reported that it
+# kept /etc/saturn-fan-cache.json because it did not validate
 
 # If you migrated fan control:
 qnap-tsx70-fancontrol status
@@ -200,10 +264,24 @@ The panel holds its last contents. A stale writer is still running, or the new
 service failed to start. Check both.
 
 **Fan control will not start.**
-It is enabled but not started on purpose, and it needs a calibration. If your
-cache migrated, `qnap-tsx70-fancontrol status` shows it; start the service
-normally. If it did not migrate, read [FAN_CONTROL.md](FAN_CONTROL.md) — the
-calibration procedure stops your fan and should not be run unattended.
+It is never started by the installer, and it is only *enabled* when a valid
+calibration cache is already in place — an enabled service with no calibration
+fails at every boot until systemd's start limit stops trying. If your cache
+migrated, `qnap-tsx70-fancontrol status` shows it and you can
+`systemctl start qnap-tsx70-fancontrol`. If it did not migrate, read
+[FAN_CONTROL.md](FAN_CONTROL.md) and then:
+
+```bash
+sudo qnap-tsx70-fancontrol calibrate --yes    # stops the fan; supervise it
+sudo systemctl enable --now qnap-tsx70-fancontrol
+```
+
+**The installer refuses to start because something holds the serial port.**
+That is deliberate for a process it does not recognise. `sudo fuser -v
+/dev/ttyS1` names it. Stop it, or — if you know what it is and will stop it
+yourself — re-run with `--allow-serial-owner PID`. The installer still never
+signals that process, and still refuses to continue unless the port is free
+by the time the service needs it. `--force` does not cover this case.
 
 **I want to start over.**
 `sudo ./scripts/uninstall.sh --purge` removes everything including config and

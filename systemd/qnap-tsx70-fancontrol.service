@@ -11,6 +11,11 @@ After=systemd-modules-load.service
 # chip's own automatic mode is left in charge by the safe-state handler.
 StartLimitIntervalSec=300
 StartLimitBurst=5
+# Defence in depth, not a substitute for the installer's lifecycle: without a
+# calibration the control loop has nothing to work from and exits. The
+# installer already refuses to enable this unit until the cache validates;
+# this stops a hand-enabled unit from burning its start limit at every boot.
+ConditionPathExists=/var/lib/qnap-tsx70/fan-calibration.json
 
 [Service]
 Type=simple

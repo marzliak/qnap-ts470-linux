@@ -5,6 +5,87 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — installer, uninstaller and diagnostics safety
+
+Post-merge review of [#2] found failure paths the 234 passing tests did not
+cover. None of this had reached hardware; the fixes protect the migration,
+reinstall, rollback and diagnostic paths before it does.
+
+- **Migration and reinstall are no longer blocked by their own serial port.**
+  Preflight now identifies who holds the port. A legacy `saturn-lcd` or an
+  already-running `qnap-tsx70-lcd` is the planned transition and is stopped
+  after the backup exists; the port is then confirmed released before the new
+  service opens it. An unrecognised process still stops the install, and
+  `--force` deliberately does not override that — the new
+  `--allow-serial-owner PID` is the documented, narrow escape hatch, and it
+  never signals the process it names.
+- **A fan service that will not stop aborts the run.** Both the installer and
+  the uninstaller now require systemd to report the unit inactive *and* no
+  known fan-control process to remain before any artifact is removed. Neither
+  claims the chip is back in automatic mode without confirming it.
+- **The legacy PID file is validated before anything is signalled.** Malformed,
+  empty, stale and reused PIDs are each handled explicitly; identity is checked
+  against `/proc/<pid>/comm`, the resolved executable and — for interpreted
+  scripts — an absolute script path in argv. A process that ignores `SIGTERM`
+  aborts the install rather than being killed, because `SIGKILL` would skip the
+  handler that frees the fans.
+- **`--dry-run` is non-mutating everywhere, including rollback.** `rollback()`
+  used to call `systemctl`, `rm` and `cp` directly, so a trapped failure during
+  a dry run could change the host for real.
+- **Rollback is transactional.** A manifest records the previous existence,
+  content, mode and unit enablement/activity of every path the run can touch,
+  so a pre-existing new-name artifact is restored instead of deleted and only
+  paths this run created are removed. The trap stays armed through legacy
+  cleanup, `daemon-reload` and post-cleanup validation, and is disarmed inside
+  `rollback()` itself so a failing restore cannot re-enter the handler.
+- **An invalid legacy calibration cache is preserved**, at its original path
+  and in the backup, and the cleanup summary no longer claims it was removed.
+- **Fan control is not enabled without a valid calibration.** The unit also
+  carries `ConditionPathExists=` as defence in depth.
+- **One source of truth for configuration.** `qnap-tsx70-lcd --print-config KEY`
+  returns the effective value, and the shell scripts use it instead of their
+  own `sed`, which disagreed with the runtime about quotes and inline comments.
+  `qnap-tsx70-fancontrol validate-cache` does the same for the calibration
+  schema.
+- **Diagnostics.** IPv6 redaction now covers compressed, expanded, CIDR,
+  zone-ID and IPv4-mapped forms through a tested `ipaddress`-based filter
+  (`scripts/redact.py`) rather than one regex, while leaving timestamps and
+  ordinary colon-separated text alone. Writing with `-o` is a transaction:
+  temporary file in the destination directory, both collection and redaction
+  must succeed, mode 0600, atomic rename, and only then a success message.
+  Invalid directories, a directory as the target, permission failures and a
+  missing argument all exit nonzero and leave nothing behind.
+- **Documentation.** The rollback commands no longer copy unit files and the
+  cache into `/usr/local/bin`; the backup is laid out by kind. Manual migration
+  covers `saturn-fancontrol.service`, `saturn-fan.service` and the LCD, and
+  verifies each. The documented rollback is executed against a fixture backup
+  tree by the test suite, so it cannot drift from the layout again.
+
+### Added
+
+- `scripts/redact.py`, the diagnostic redaction filter, and a fake-root test
+  harness (`tests/fixtures.py`) that runs the installer and uninstaller for
+  real against fake `systemctl`, `fuser` and `/proc`, without root or hardware.
+- `qnap-tsx70-lcd --print-config KEY` and
+  `qnap-tsx70-fancontrol validate-cache`, both read-only.
+- `install.sh --allow-serial-owner PID`.
+
+### Testing
+
+The suite is now **330 tests**, up from 234. The new ones execute the failure
+paths rather than searching the source for strings: stop failures, PID
+identity, dry-run non-mutation proved by hashing the whole fixture tree,
+rollback from a failure injected into each phase, a state matrix in which every
+artifact starts present and absent, and the documented recovery commands run
+against a fixture backup.
+
+**Still not run on physical TS-x70 hardware.** Everything above was validated
+offline.
+
+[#2]: https://github.com/marzliak/qnap-ts470-linux/pull/2
+
 ## [2.0.0] - 2026-09-12
 
 A breaking release. Everything is renamed, fan control changes behaviour, and

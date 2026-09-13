@@ -408,6 +408,18 @@ sudo systemctl restart qnap-tsx70-lcd
 | `net_interface` | *(empty)* | Interface for the throughput page; empty follows the default route |
 | `smart_enabled` | `true` | Query SMART at all |
 
+Values may be quoted and may carry an inline comment; the last assignment of a
+repeated key wins. To see exactly what the service will use — which is what
+`install.sh` and `diagnose.sh` ask for, so that nothing re-implements this
+grammar — run:
+
+```bash
+qnap-tsx70-lcd --print-config serial_port
+```
+
+It prints one effective value on stdout and exits nonzero, with a message on
+stderr, if that key is malformed.
+
 ### Timing keys
 
 | Key | Default | Notes |
@@ -877,6 +889,12 @@ Include SMART summaries as well:
 sudo ./scripts/diagnose.sh --with-smart -o bundle.txt
 ```
 
+Writing to a file is all-or-nothing: the bundle is collected and redacted into
+a temporary file next to the target, set to mode 0600 and only then renamed
+into place. If anything fails — a directory that does not exist, a path that
+is a directory, no permission, a redactor that cannot run — the command exits
+nonzero, says why, leaves no partial file, and does **not** report success.
+
 The bundle contains the distribution and kernel, chassis model, CPU and memory
 totals, installed versions, loaded modules, serial ports and permissions, hwmon
 sensor names, fan controller state, your configuration, the disk list, service
@@ -885,7 +903,10 @@ status and recent logs.
 ### What is redacted
 
 Hostnames, IPv4 and IPv6 addresses, MAC addresses, UUIDs and anything labelled
-as a serial number are replaced with placeholders. IP and MAC addresses are
+as a serial number are replaced with placeholders. IPv6 covers the compressed
+forms as well — `::1`, `fe80::1%eth0`, `2001:db8::/32` and IPv4-mapped
+addresses — because a filter that only recognised the expanded form would let
+every address a real machine actually logs straight through. IP and MAC addresses are
 never collected in the first place, and the DMI fields read are limited to
 vendor and model — `product_uuid` and `board_serial` are never touched.
 

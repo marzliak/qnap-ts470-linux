@@ -111,10 +111,56 @@ Fan control is never installed by default:
 sudo ./scripts/install.sh --with-fan-control
 ```
 
-This installs the binary and the unit, enables the unit, and **does not start
-it** — because `run` requires a calibration that only you can authorise.
+This installs the binary and the unit. It **does not start** the service —
+`run` requires a calibration that only you can authorise — and it **does not
+enable** it either, unless a valid calibration cache is already in place.
 
-The unit file is `systemd/qnap-tsx70-fancontrol.service`.
+That distinction matters. A fan service enabled without a calibration is
+started at every boot, exits immediately because it has nothing to work from,
+and after five attempts in five minutes systemd stops trying and leaves it in
+`failed`. So:
+
+- **No calibration yet** — the unit is installed and left disabled. Calibrate
+  first, then enable it in one step:
+
+  ```bash
+  sudo qnap-tsx70-fancontrol calibrate --yes    # stops the fan; supervise it
+  sudo systemctl enable --now qnap-tsx70-fancontrol
+  ```
+
+- **A valid calibration already exists**, for example one migrated from a
+  legacy install, — the installer enables the unit for the next boot but still
+  does not start it. Start it when you are watching:
+
+  ```bash
+  qnap-tsx70-fancontrol status                  # confirm the calibration
+  sudo systemctl start qnap-tsx70-fancontrol
+  ```
+
+Whether a cache counts as valid is decided by the binary itself, not by the
+installer:
+
+```bash
+qnap-tsx70-fancontrol validate-cache --cache /var/lib/qnap-tsx70/fan-calibration.json
+```
+
+That subcommand is read-only, touches no hardware and exits nonzero when the
+cache is missing, unparseable or does not describe any channel.
+
+The unit file is `systemd/qnap-tsx70-fancontrol.service`. It also carries
+`ConditionPathExists=/var/lib/qnap-tsx70/fan-calibration.json` as defence in
+depth: a unit enabled by hand before calibrating is skipped at boot instead of
+burning its start limit. That condition is a backstop, not the mechanism — the
+installer's own lifecycle above is what is supposed to get this right.
+
+### Uninstalling with fan control running
+
+`scripts/uninstall.sh` stops the fan service before it removes anything, and
+verifies both that systemd reports the unit inactive and that no fan-control
+process is left. If either check fails it removes **nothing** and tells you how
+to recover. That is deliberate: deleting the unit and the binary while a writer
+is still driving PWM leaves a process systemd no longer knows about and no
+executable left to restore the chip's automatic mode.
 
 ---
 
@@ -161,6 +207,17 @@ sudo systemctl start qnap-tsx70-fancontrol
 This is what the service runs. It requires a stored calibration and exits
 nonzero if there is none. Useful flags: `--interval`, `--temp-min`,
 `--temp-max`, `--dry-run`.
+
+### `validate-cache` — read-only
+
+```bash
+qnap-tsx70-fancontrol validate-cache --cache /var/lib/qnap-tsx70/fan-calibration.json
+```
+
+Loads a calibration cache through the same validation the control loop uses
+and exits 0 only if it is usable. Touches no hardware and needs no root. This
+is what `scripts/install.sh` asks before it enables the service or removes a
+legacy cache.
 
 ### `safe-state` — recovery
 

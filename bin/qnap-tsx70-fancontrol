@@ -659,6 +659,28 @@ def cmd_safe_state(args):
     return 0
 
 
+def cmd_validate_cache(args):
+    """Say whether a calibration cache is usable. Read-only, no hardware.
+
+    The installer needs this verdict before it may enable the service or
+    delete a legacy cache, and the schema must not be re-implemented in shell
+    for it. Exits 0 when the cache validates, 1 when it does not.
+    """
+    path = args.cache
+    if not os.path.exists(path):
+        log("no calibration cache at %s" % path)
+        return 1
+    try:
+        with open(path, encoding="utf-8") as handle:
+            cache = validate_cache(json.load(handle))
+    except (OSError, ValueError, FanError) as exc:
+        log("calibration cache %s is not usable: %s" % (path, exc))
+        return 1
+    log("calibration cache %s is valid (channels %s)"
+        % (path, cache["channels"]))
+    return 0
+
+
 def _settle(controller, channel, seconds, temp_path, stall_started=None):
     """Wait, while watching for an overheat or an over-long stall.
 
@@ -1011,6 +1033,11 @@ def build_parser():
     safe = sub.add_parser("safe-state", parents=[common],
                           help="force all channels back to automatic mode")
     safe.set_defaults(func=cmd_safe_state)
+
+    check = sub.add_parser("validate-cache", parents=[common],
+                           help="check a calibration cache without touching "
+                                "the hardware")
+    check.set_defaults(func=cmd_validate_cache)
     return parser
 
 
