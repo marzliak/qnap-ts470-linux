@@ -1,0 +1,45 @@
+[Unit]
+Description=QNAP TS-x70 chassis fan control (experimental)
+Documentation=https://github.com/marzliak/qnap-ts470-linux/blob/main/docs/FAN_CONTROL.md
+After=local-fs.target
+# Failing repeatedly means the machine cannot control its fans. Give up
+# rather than hiding the condition behind an endless restart loop; the
+# chip's own automatic mode is left in charge by the safe-state handler.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# 'run' is the continuous control loop. It exits nonzero if the temperature
+# input is lost or the controller cannot be resolved, after forcing the fans
+# back to the chip's automatic mode, so this unit must be allowed to restart.
+ExecStart=/usr/local/bin/qnap-tsx70-fancontrol run
+# Closes the SIGKILL / OOM-kill hole: if the process dies without running its
+# own handlers, this still hands the fans back to the chip's automatic mode.
+ExecStopPost=-/usr/local/bin/qnap-tsx70-fancontrol safe-state
+Restart=always
+RestartSec=15
+# The control loop restores the safe state on SIGTERM within one iteration.
+TimeoutStopSec=30
+
+
+# Runs as root and needs write access to /sys, so ProtectKernelTunables and
+# ProtectSystem=full are intentionally NOT set. This service is not sandboxed
+# away from the hardware it exists to drive.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/qnap-tsx70
+
+[Install]
+WantedBy=multi-user.target
