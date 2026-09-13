@@ -26,7 +26,9 @@ jobs:
           python-version: "${{ matrix.python-version }}"
 
       - name: Byte-compile every Python executable
-        run: python3 -m py_compile bin/qnap-tsx70-lcd bin/qnap-tsx70-fancontrol
+        run: |
+          python3 -m py_compile bin/qnap-tsx70-lcd bin/qnap-tsx70-fancontrol \
+                                scripts/redact.py scripts/qnap_lock.py
 
       - name: Run the test suite
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -54,8 +56,11 @@ jobs:
 
       # Pre-installed on ubuntu-latest runners. This is the only place
       # ShellCheck runs: it is not available in every local environment.
+      # `style` is the most inclusive severity, and the scripts are clean at
+      # it - the installer's process and rollback handling is not somewhere to
+      # accept advice this tool can give and be ignored.
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/*.sh
+        run: shellcheck --severity=style scripts/*.sh
 
   units:
     name: systemd unit validation

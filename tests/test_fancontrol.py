@@ -280,13 +280,17 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self._read("pwm3"), "68")
         self.assertEqual(self._read("pwm3_enable"), "1")
 
-    def test_write_failure_counter_increments(self):
+    def test_write_failures_are_counted_per_channel_and_register(self):
         controller = fan.FanController(os.path.join(self.tmp.name, "gone"))
         with quiet():
             self.assertTrue(controller.set_pwm(3, 100) is False)
-            self.assertEqual(controller.write_failures, 1)
+            self.assertEqual(controller.failure_count(3, "pwm3"), 1)
             controller.set_pwm(3, 100)
-        self.assertEqual(controller.write_failures, 2)
+        self.assertEqual(controller.failure_count(3, "pwm3"), 2)
+        # Not one number for the whole chip: a different channel, and a
+        # different register on the same channel, each keep their own history.
+        self.assertEqual(controller.failure_count(1, "pwm1"), 0)
+        self.assertEqual(controller.failure_count(3, "pwm3_enable"), 0)
 
     def test_rpm_of_missing_channel_is_zero(self):
         self.assertEqual(self.controller.rpm(9), 0)
@@ -378,9 +382,20 @@ class LockTests(unittest.TestCase):
         second = fan.acquire_lock(self.path)
         second.close()
 
-    def test_lock_path_follows_the_cache_directory(self):
-        self.assertEqual(fan.lock_path_for("/var/lib/qnap-tsx70/fan-calibration.json"),
-                         "/var/lib/qnap-tsx70/fancontrol.lock")
+    def test_the_lock_does_not_follow_the_cache_directory(self):
+        # Reversed on purpose. The lock used to be placed beside the cache, so
+        # `calibrate --cache /tmp/mine.json` took a lock in /tmp while the
+        # service held one in /var/lib - two writers, one set of registers,
+        # no contention. The lock names the chip now.
+        device = "/sys/devices/platform/f71882fg.2592"
+        paths = fan.writer_lock_paths(device, root="/run/qnap-tsx70")
+        self.assertEqual(paths, ["/run/qnap-tsx70/fancontrol.lock",
+                                 "/run/qnap-tsx70/fancontrol-f71882fg.2592.lock"])
+        for cache in ("/var/lib/qnap-tsx70/fan-calibration.json",
+                      "/tmp/mine.json", "/home/someone/cal.json"):
+            self.assertEqual(
+                fan.writer_lock_paths(device, root="/run/qnap-tsx70"), paths,
+                "the lock moved with the cache %s" % cache)
 
 
 class CliTests(unittest.TestCase):

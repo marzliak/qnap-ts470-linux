@@ -107,8 +107,16 @@ class InstallerDryRunTests(unittest.TestCase):
         self.assertEqual(snapshot(), before, "the dry run modified the system")
 
     def test_lcd_only_is_the_default(self):
+        # Asserted behaviourally rather than by absence of the word: the
+        # transaction manifest legitimately records the fan paths so that a
+        # rollback knows they were absent, which is not the same as
+        # installing, enabling or starting anything.
         self.assertIn("mode:       LCD only", self.result.stdout)
-        self.assertNotIn("qnap-tsx70-fancontrol", self.result.stdout)
+        for action in ("install -m 0755 %s/bin/qnap-tsx70-fancontrol" % REPO_ROOT,
+                       "systemctl enable qnap-tsx70-fancontrol.service",
+                       "systemctl start qnap-tsx70-fancontrol.service",
+                       "fan control (experimental)"):
+            self.assertNotIn(action, self.result.stdout, action)
 
     def test_fan_control_dry_run_is_opt_in_and_never_started(self):
         result = run(["bash", "scripts/install.sh", "--dry-run", "--skip-deps",
@@ -205,18 +213,23 @@ class RollbackReachabilityTests(unittest.TestCase):
             src = fh.read()
         probe = src.replace("set -Eeuo pipefail", shell_options)
         # Inject a failure at the first statement of install_files.
-        marker = '    run install -d -m 0755 "$STATE_DIR"'
-        probe = probe.replace(marker, "    false\n" + marker)
+        marker = ('    step "Installing files"\n'
+                  '    txn_mkdir "$STATE_DIR" 0755')
+        self.assertIn(marker, probe, "the probe's injection point moved")
+        probe = probe.replace(marker, "    false\n" + marker, 1)
         # Pretend a legacy install exists, without touching the real system.
         for name, stub in (
             ("detect_legacy() {", "detect_legacy() { return 0\n"),
-            ("make_backup() {",
-             'make_backup() { BACKUP_DIR="$(mktemp -d)"; return 0\n'),
-            ("stop_legacy() {", "stop_legacy() { return 0\n"),
+            ("txn_begin() {",
+             'txn_begin() { BACKUP_DIR="$(mktemp -d)"; TXN_DIR="$BACKUP_DIR/txn"; return 0\n'),
+            ("txn_snapshot_all() {", "txn_snapshot_all() { return 0\n"),
+            ("make_backup() {", "make_backup() { return 0\n"),
+            ("stop_current_services() {", "stop_current_services() { return 0\n"),
+            ("verify_port_released() {", "verify_port_released() { return 0\n"),
             ("migrate_cache() {", "migrate_cache() { return 0\n"),
             ("rollback() {", 'rollback() { echo "ROLLBACK RAN"; return 0\n'),
         ):
-            probe = probe.replace(name, stub)
+            probe = probe.replace(name, stub, 1)
         path = os.path.join(REPO_ROOT, self.PROBE)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(probe)

@@ -24,11 +24,12 @@ not a test result. `Pro` is not a cosmetic suffix: the Pro towers are Ivy
 Bridge, the non-Pro models of the same number are an older Sandy Bridge
 platform. See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
-**Version 2.0.0 has not yet been run on real hardware.** It is a rewrite of
-code that was; the protocol and register behaviour it relies on were observed
-on the reference TS-470 Pro, but this implementation has so far only been
-validated offline, by tests and against simulated devices. Treat the first
-install as the first hardware test — and read
+**This version has not yet been run on real TS-x70 hardware.** It is a rewrite
+of code that was; the protocol and register behaviour it relies on were
+observed on the reference TS-470 Pro, but this implementation — including the
+installer's migration, rollback and diagnostic paths — has so far only been
+validated offline, by tests and against simulated devices and a fake root.
+Treat the first install as the first hardware test — and read
 [docs/LCD_GUIDE.md](docs/LCD_GUIDE.md) first, because it writes to a serial
 port and, with fan control enabled, to your fan controller.
 
@@ -93,8 +94,11 @@ The full walkthrough, including what to do when nothing appears, is in
 sudo ./scripts/install.sh --with-fan-control
 ```
 
-This installs and enables the service but does **not** start it, because it
-needs a calibration run that stops your fan. See
+This installs the service but does **not** start it, because it needs a
+calibration run that stops your fan — and it does not enable it either unless
+a valid calibration is already there, because an enabled fan service with no
+calibration just fails at every boot. Calibrate first, then
+`sudo systemctl enable --now qnap-tsx70-fancontrol`. See
 [docs/FAN_CONTROL.md](docs/FAN_CONTROL.md).
 
 ### Removing it

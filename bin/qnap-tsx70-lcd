@@ -248,6 +248,93 @@ def load_config(path):
         return apply_limits(dict(DEFAULTS))
 
 
+def format_config_value(value):
+    """Render an effective value for a shell to read back.
+
+    One line, no quoting, no trailing decoration: the caller does
+    `port="$(... --print-config serial_port)"` and gets exactly the string the
+    runtime itself would use.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    # Floats are printed as floats. Collapsing 5.0 to 5 would make the
+    # "effective value" differ from the one the runtime actually holds, which
+    # is the whole point of this command.
+    return str(value)
+
+
+def config_problems_for(text, key):
+    """Problems in `text` that concern one specific key.
+
+    Scoped deliberately: --print-config must refuse to answer for a key the
+    operator got wrong, without failing because some unrelated line elsewhere
+    in the file has a typo.
+    """
+    problems = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            # `serial_port /dev/ttyS1` reads as a setting but sets nothing.
+            if line.split()[0].strip().lower() == key:
+                problems.append("line %d: not a key = value pair: %r"
+                                % (number, line))
+            continue
+        name = line.partition("=")[0].strip().lower()
+        if name != key:
+            continue
+        for problem in config_problems(raw):
+            problems.append(problem.replace("line 1:", "line %d:" % number, 1))
+    return problems
+
+
+def print_config(key, path, override=None, stream=None, error_stream=None):
+    """Print one effective configuration value. Returns a process exit code.
+
+    This exists because the installer and the diagnostics used to parse the
+    file themselves and disagreed with the runtime about quoting and inline
+    comments, rejecting a perfectly valid serial_port. There is one grammar,
+    and it lives here.
+    """
+    stream = sys.stdout if stream is None else stream
+    error_stream = sys.stderr if error_stream is None else error_stream
+    key = key.strip().lower()
+    if key not in DEFAULTS:
+        print("error: unknown configuration key: %s" % key, file=error_stream)
+        return 2
+
+    text = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print("error: cannot read %s: %s" % (path, exc), file=error_stream)
+        return 2
+
+    if text is not None:
+        # A malformed value for the requested key is an error, not a silent
+        # fallback to the default: the caller is about to act on it.
+        problems = config_problems_for(text, key)
+        if problems:
+            for problem in problems:
+                print("error: %s: %s" % (path, problem), file=error_stream)
+            return 2
+
+    conf = parse_config(text) if text is not None else apply_limits(dict(DEFAULTS))
+    if override is not None:
+        conf = dict(conf)
+        conf[key] = override
+    rendered = format_config_value(conf[key])
+    if "\n" in rendered or "\x00" in rendered:
+        print("error: %s contains an unusable character" % key, file=error_stream)
+        return 2
+    print(rendered, file=stream)
+    return 0
+
+
 def enabled_pages(conf):
     """Ordered list of valid page names from the config, duplicates preserved."""
     names = [p.strip().lower() for p in str(conf["pages"]).split(",")]
@@ -1174,6 +1261,9 @@ def build_parser():
                       help="clear the display, switch the backlight off and exit")
     mode.add_argument("--list-pages", action="store_true",
                       help="list available page names and exit")
+    mode.add_argument("--print-config", metavar="KEY",
+                      help="print one effective configuration value and exit; "
+                           "the single source of truth the shell scripts use")
     return parser
 
 
@@ -1187,6 +1277,17 @@ def main(argv=None):
         for name in PAGES:
             print(name)
         return 0
+
+    if args.print_config is not None:
+        # `is not None`, not truthiness: --print-config '' is falsy, and
+        # falling through from here reaches the run path, which opens the
+        # panel's serial port.
+        #
+        # --port is an override of the effective value, so it has to be
+        # visible here too or the scripts would read a stale port.
+        override = args.port if args.print_config.strip().lower() == "serial_port" \
+            and args.port else None
+        return print_config(args.print_config, args.config, override=override)
 
     if args.check:
         ok, _ = preflight(conf, config_path=args.config)
