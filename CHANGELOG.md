@@ -75,6 +75,12 @@ automatically — see [docs/MIGRATION_FROM_SATURN.md](docs/MIGRATION_FROM_SATURN
   `grep`/`awk` pipelines. It uses `smartctl --json` with timeouts and no shell.
 - The installer no longer exits nonzero after a successful install because of a
   trailing `systemctl is-active` under `set -e`.
+- **Several display rows silently overflowed 16 columns and were truncated.**
+  The clock rendered 17 characters, losing the last digit of the year. The RAM
+  row rendered 18 on any machine with 10 GiB or more — including the reference
+  unit — losing its unit suffix. The disk summary and the combined power-on
+  hours row overflowed at ordinary values. Rows now fit at the widest plausible
+  input, verified by a test that renders every page at worst case.
 - The manual PID file is gone; systemd tracks the process.
 
 ### Added
