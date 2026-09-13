@@ -37,14 +37,17 @@ TAGGED_ID_RE = re.compile(r"(PARTUUID|UUID|ID_SERIAL|WWN)=[^\s\"]*",
                           re.IGNORECASE)
 
 # Loose candidates. Both are confirmed by ipaddress before anything is cut.
+# The lookbehinds exclude only alphanumerics. Excluding `:` and `.` as well
+# looked tidier and quietly stopped `addr:192.0.2.1` and `addr:fe80::1` from
+# being recognised at all.
 IPV6_CANDIDATE_RE = re.compile(
-    r"(?<![0-9A-Za-z:.])"
+    r"(?<![0-9A-Za-z])"
     r"[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:\.[0-9]{1,3}){0,3}"
     r"(?:%[0-9A-Za-z_.\-]+)?"
     r"(?:/[0-9]{1,3})?")
 
 IPV4_CANDIDATE_RE = re.compile(
-    r"(?<![0-9A-Za-z.:])"
+    r"(?<![0-9A-Za-z])"
     r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
     r"(?:/[0-9]{1,2})?"
     r"(?![0-9A-Za-z.])")

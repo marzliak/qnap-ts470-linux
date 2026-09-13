@@ -51,6 +51,13 @@ class IPv6Tests(RedactorTests):
     def test_an_address_followed_by_a_colon_keeps_its_punctuation(self):
         self.assertEqual(self.line("peer fe80::1: down"), "peer [ipv6]: down")
 
+    def test_an_address_glued_to_a_delimiter_is_still_found(self):
+        # The lookbehind used to exclude `:` and `.` as well as alphanumerics,
+        # so an address written straight after either was never even a
+        # candidate.
+        self.assertEqual(self.line("addr:fe80::1"), "addr:[ipv6]")
+        self.assertEqual(self.line("prefix.2001:db8::1 x"), "prefix.[ipv6] x")
+
     def test_the_zone_id_goes_with_the_address(self):
         self.assertNotIn("eth0", self.line("link fe80::1%eth0 up"))
 
@@ -59,6 +66,9 @@ class IPv4AndFriendsTests(RedactorTests):
     def test_ipv4_and_cidr(self):
         self.assertEqual(self.line("ip 192.0.2.42 end"), "ip [ip] end")
         self.assertEqual(self.line("net 198.51.100.0/24 end"), "net [ip] end")
+
+    def test_an_ipv4_glued_to_a_delimiter_is_still_found(self):
+        self.assertEqual(self.line("addr:192.0.2.50"), "addr:[ip]")
 
     def test_mac_addresses(self):
         self.assertEqual(self.line("mac 00:11:22:33:44:55 end"),

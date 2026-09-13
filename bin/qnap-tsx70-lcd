@@ -257,8 +257,9 @@ def format_config_value(value):
     """
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, float) and value == int(value):
-        return str(int(value))
+    # Floats are printed as floats. Collapsing 5.0 to 5 would make the
+    # "effective value" differ from the one the runtime actually holds, which
+    # is the whole point of this command.
     return str(value)
 
 
@@ -1277,7 +1278,11 @@ def main(argv=None):
             print(name)
         return 0
 
-    if args.print_config:
+    if args.print_config is not None:
+        # `is not None`, not truthiness: --print-config '' is falsy, and
+        # falling through from here reaches the run path, which opens the
+        # panel's serial port.
+        #
         # --port is an override of the effective value, so it has to be
         # visible here too or the scripts would read a stale port.
         override = args.port if args.print_config.strip().lower() == "serial_port" \

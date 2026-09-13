@@ -18,19 +18,35 @@ Safety model (docs/FAN_CONTROL.md has the full discussion):
     more than one device matches;
   * channels are discovered, never assumed - the reference unit drives only
     channel 3;
-  * a lock file prevents an interactive calibration and the service loop from
-    fighting over the same registers;
+  * a writer lock named after the physical controller - not after the cache
+    file - prevents an interactive calibration and the service loop from
+    fighting over the same registers, whatever --cache each of them was
+    given. safe-state deliberately takes no lock, so it always works as an
+    emergency recovery;
   * SIGTERM, SIGINT, SIGHUP and SIGQUIT are all handled before the first
     register write, so an SSH disconnect mid-calibration still fails safe;
   * every exit path - clean, signalled or crashed - forces full duty and hands
     the channels back to automatic mode, then reads the registers back to
-    confirm it actually happened;
-  * calibration refuses to start on a hot machine, aborts if temperature rises
-    during the sweep, and caps how long a fan may sit stopped;
+    confirm it actually happened. That readback decides the exit status: a
+    stop that cannot prove the chip took the fans back exits nonzero instead
+    of reporting a clean shutdown. `safe-state --dry-run` writes nothing and
+    reads nothing back, so it exits 3 - "previewed, not proven" - and never
+    claims a verified handback;
+  * a second stop signal cannot overrule that verdict. The safe state blocks
+    stop signals while it works, and unblocking them is what delivers one that
+    arrived in the meantime, so the verdict is computed, logged and recorded
+    before the mask comes down and the signal is re-raised only afterwards;
+  * calibration refuses to start on a hot machine, aborts if the temperature
+    rises during the sweep or stops being readable at all, caps how long a fan
+    may sit stopped, and treats every one of its own control writes as a hard
+    gate: a duty the chip did not acknowledge aborts the sweep instead of
+    being followed by a lower one;
   * a duty floor stops a corrupt or hand-edited calibration from pinning a fan
     off with no way to restart it;
   * losing the temperature input escalates to full speed and then exits
-    nonzero, so systemd sees the failure instead of a silent stall.
+    nonzero, so systemd sees the failure instead of a silent stall;
+  * refused register writes are counted per channel and per register, so a
+    healthy fan answering its own commands cannot mask a dead one next to it.
 """
 
 import argparse
@@ -38,6 +54,7 @@ import errno
 import fcntl
 import glob
 import json
+import math
 import os
 import re
 import signal
@@ -49,8 +66,19 @@ VERSION = "2.0.0"
 
 STATE_DIR = "/var/lib/qnap-tsx70"
 CACHE_FILE = os.path.join(STATE_DIR, "fan-calibration.json")
-LOCK_FILE = os.path.join(STATE_DIR, "fancontrol.lock")
 DEFAULT_DEVICE_GLOB = "/sys/devices/platform/f71882fg.*"
+
+# Writer locks live under a canonical runtime root, never beside the cache.
+# A lock has to mean "this chip is taken", and --cache names a file: two runs
+# pointed at different cache directories drive the same PWM registers and must
+# still contend. QNAP_TSX70_LOCK_DIR is a documented test seam - it reroots
+# the lock tree for the suite and changes nothing on a real host, where it is
+# unset - and it is deliberately not a command-line flag, because a flag is
+# something an operator could use to talk themselves out of the lock.
+DEFAULT_LOCK_ROOT = "/run/qnap-tsx70"
+LOCK_ROOT = os.environ.get("QNAP_TSX70_LOCK_DIR") or DEFAULT_LOCK_ROOT
+GLOBAL_LOCK_NAME = "fancontrol.lock"
+LOCK_FILE = os.path.join(LOCK_ROOT, GLOBAL_LOCK_NAME)
 
 PWM_MIN = 0
 PWM_MAX = 255
@@ -65,6 +93,16 @@ PWM_FLOOR = 64
 
 TEMP_MIN = 30           # at or below this: minimum calibrated duty
 TEMP_MAX = 70           # at or above this: full speed
+
+# The band a CPU package sensor may plausibly report, in Celsius. Outside it
+# the value is a broken sensor, a misparsed register or a unit mix-up, not a
+# temperature: a running x86 package does not sit below -50 C, and above 150 C
+# the machine has long since shut itself down. Deliberately wide - the job
+# here is to reject nonsense, not to second-guess a hot machine, which
+# CALIBRATION_ABORT_TEMP does. The control loop and the calibration sweep
+# share these bounds so "a reading" means the same thing in both.
+TEMP_PLAUSIBLE_MIN = -50
+TEMP_PLAUSIBLE_MAX = 150
 INTERVAL = 10           # seconds between control iterations
 TEMP_FAILURE_LIMIT = 3  # consecutive bad temperature reads before failing safe
 WRITE_FAILURE_LIMIT = 3 # consecutive failed register writes before failing safe
@@ -82,6 +120,12 @@ CALIBRATION_MAX_STALL_S = 45     # longest a fan may sit at 0 RPM
 
 SAFE_PWM = PWM_MAX      # duty applied whenever the safe state is forced
 
+# `safe-state --dry-run` writes no register and reads none back. It is a
+# preview, and a preview is not evidence about a fan, so it gets its own exit
+# status rather than 0: a caller that gates a deletion on `safe-state && rm`
+# must not be able to earn that `rm` by adding --dry-run.
+EXIT_NOT_VERIFIED = 3
+
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)
 
 
@@ -95,6 +139,38 @@ class Terminated(BaseException):
     Deliberately derived from BaseException, not Exception: a stray
     `except Exception` must not be able to swallow a stop request.
     """
+
+
+# Every aggregate handback this process could not prove, recorded the moment
+# the verdict is known and before the stop signals are let through again.
+#
+# main() exits 0 on Terminated, because a signalled stop is a normal way for
+# this program to end. It is not a normal way to end with a fan parked at a
+# stall duty, and a second stop signal is delivered at exactly the wrong
+# moment: restoring the signal mask inside safe_state() is what delivers one
+# that arrived while the restore was running, and it used to unwind straight
+# past the `return False` underneath it. A verdict that only exists as a
+# return value cannot survive that, so it is recorded here as well, where it
+# outlives whatever the signal does to the call stack.
+_UNVERIFIED_HANDBACKS = []
+
+
+def record_unverified_handback(detail):
+    """Remember a handback this process could not prove. Never cleared by luck."""
+    _UNVERIFIED_HANDBACKS.append(detail)
+
+
+def handback_unverified():
+    return bool(_UNVERIFIED_HANDBACKS)
+
+
+def handback_detail():
+    return "; ".join(_UNVERIFIED_HANDBACKS)
+
+
+def reset_handback_record():
+    """Start a run with an empty record. Called by main(), and by the suite."""
+    del _UNVERIFIED_HANDBACKS[:]
 
 
 # --------------------------------------------------------------------------
@@ -122,6 +198,29 @@ def calc_pwm(temp, min_pwm, max_pwm, temp_min=TEMP_MIN, temp_max=TEMP_MAX):
         return max_pwm
     ratio = (temp - temp_min) / float(temp_max - temp_min)
     return int(round(min_pwm + ratio * (max_pwm - min_pwm)))
+
+
+def temperature_is_plausible(value):
+    """True when `value` can be used as a temperature reading.
+
+    None is "we do not know" and is never a reading. Everything else has to
+    sit inside the documented TEMP_PLAUSIBLE_* band.
+
+    The two-sided band already excludes NaN and the infinities - every
+    comparison against NaN is false, so NaN fails the lower bound - but the
+    non-finite case is written out anyway, because that property is subtle and
+    the rewrite that loses it, `not (number <= MIN or number >= MAX)`, reads
+    like a harmless refactor and lets NaN straight through.
+    """
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(number):
+        return False
+    return TEMP_PLAUSIBLE_MIN < number < TEMP_PLAUSIBLE_MAX
 
 
 def natural_key(path):
@@ -283,14 +382,55 @@ def read_temp(path):
     if raw is None:
         return None
     celsius = raw // 1000
-    if not -50 < celsius < 150:
+    if not temperature_is_plausible(celsius):
         return None
     return celsius
 
 
-def lock_path_for(cache_path):
-    """Keep the lock beside the cache so a custom --cache stays self-consistent."""
-    return os.path.join(os.path.dirname(cache_path) or ".", "fancontrol.lock")
+def controller_identity(device):
+    """A stable, filesystem-safe name for one physical controller.
+
+    The platform device's own directory name - `f71882fg.2592` - is what the
+    kernel calls the chip, so it is what the lock is named after. Anything
+    outside a conservative character set becomes an underscore, so a device
+    path can never escape the lock root or collide with a control character.
+
+    Returns "" when there is no usable identity, which is the caller's signal
+    to fall back to the global lock rather than to invent a name.
+    """
+    name = os.path.basename(os.path.normpath(device or ""))
+    if name in ("", ".", "..", os.sep):
+        return ""
+    sanitised = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    # A name that is only dots would still resolve to a directory entry.
+    return "" if sanitised.strip(".") == "" else sanitised
+
+
+def writer_lock_paths(device=None, root=None):
+    """Every lock a fan writer must hold, in the order it must take them.
+
+    Two locks, always in this order, so they cannot deadlock:
+
+      1. the canonical global lock. Every writer takes it, whatever device it
+         resolved and whatever --cache it was given. A process that cannot
+         name its controller - because discovery has not run or failed - can
+         therefore still not race one that can, which a purely per-controller
+         scheme would have allowed.
+      2. the per-controller lock, named after the chip. This is the primary
+         one: it is what makes "the same controller" the thing runs contend
+         over, and it keeps the name meaningful on a host with more than one.
+
+    Holding both means two different controllers serialise against each other
+    as well. That costs nothing today - find_device() refuses to resolve an
+    ambiguous controller, so this program never drives two at once - and it is
+    the direction to be wrong in.
+    """
+    base = LOCK_ROOT if root is None else root
+    paths = [os.path.join(base, GLOBAL_LOCK_NAME)]
+    identity = controller_identity(device)
+    if identity:
+        paths.append(os.path.join(base, "fancontrol-%s.lock" % identity))
+    return paths
 
 
 def acquire_lock(path=LOCK_FILE):
@@ -319,6 +459,32 @@ def acquire_lock(path=LOCK_FILE):
     return handle
 
 
+def acquire_writer_locks(device=None, root=None):
+    """Take every writer lock, outermost first, or release what was taken.
+
+    A half-held set would leave the global lock owned by a process that then
+    exits without ever writing a register, which is exactly the stall the
+    lock exists to avoid.
+    """
+    handles = []
+    try:
+        for path in writer_lock_paths(device, root):
+            handles.append(acquire_lock(path))
+    except BaseException:
+        release_locks(handles)
+        raise
+    return handles
+
+
+def release_locks(handles):
+    """Drop writer locks innermost first. Never raises: called from `finally`."""
+    for handle in reversed(list(handles or ())):
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
 class FanController:
     """Owns every register write and knows how to put the chip back."""
 
@@ -326,7 +492,13 @@ class FanController:
         self.device = device
         self.dry_run = dry_run
         self._original = {}
-        self._write_failures = 0
+        # A stop signal that safe_state() caught while it was establishing its
+        # verdict, kept for the command to re-raise once nothing else is
+        # unwinding. See safe_state() and finish_or_stop().
+        self.deferred_stop = None
+        # {(channel, register): consecutive failures}. Never a single number:
+        # see _record_write.
+        self._write_failures = {}
 
     # -- paths -------------------------------------------------------------
     def _path(self, name):
@@ -376,8 +548,15 @@ class FanController:
             if not probe or not self.controllable(channel):
                 continue
             with self.borrowed(channel):
-                self.set_manual(channel)
-                self.set_pwm(channel, PWM_MAX)
+                # A probe the chip did not acknowledge says nothing about
+                # whether a fan is attached, and "silent" must not become
+                # "calibrate it" on the strength of a command that never
+                # landed.
+                if not (self.set_manual(channel)
+                        and self.set_pwm(channel, PWM_MAX)):
+                    log("WARN channel %d did not accept the probe; not "
+                        "treating it as active" % channel)
+                    continue
                 time.sleep(settle)
                 if self.rpm(channel) > 0:
                     active.append(channel)
@@ -393,98 +572,255 @@ class FanController:
             "enable": self.enable_mode(channel),
         }
 
-    def _record_write(self, ok):
-        """Track consecutive write failures so a dead path cannot look healthy."""
+    def _record_write(self, channel, register, ok):
+        """Count consecutive write failures per channel and per register.
+
+        This used to be one number for the whole chip, and any successful
+        write reset it. On a multi-channel board that is the wrong shape: a
+        fan whose duty register had stopped accepting anything at all never
+        reached the limit, because the healthy channel next to it answered its
+        own command every iteration and zeroed the count. The dead channel was
+        then held at whatever duty it happened to be on, silently, forever.
+
+        A success may only clear its own history, so "three refusals in a row
+        on pwm1" stays true no matter how well pwm3 is doing.
+        """
+        key = (channel, register)
         if ok:
-            self._write_failures = 0
+            self._write_failures[key] = 0
         else:
-            self._write_failures += 1
+            self._write_failures[key] = self._write_failures.get(key, 0) + 1
         return ok
 
-    @property
-    def write_failures(self):
-        return self._write_failures
+    def failure_count(self, channel, register):
+        """Consecutive failed writes on exactly one register of one channel."""
+        return self._write_failures.get((channel, register), 0)
+
+    def exhausted_writes(self, limit=WRITE_FAILURE_LIMIT):
+        """[(channel, register, count)] for every register at or over `limit`.
+
+        Any single entry is enough to fail safe: a channel nobody can command
+        is a fan nobody is in charge of, whatever the others are doing.
+        """
+        return sorted((channel, register, count)
+                      for (channel, register), count
+                      in self._write_failures.items() if count >= limit)
 
     def set_manual(self, channel):
         self.remember(channel)
         if self.dry_run:
             return True
-        ok = write_sysfs(self._path("pwm%d_enable" % channel), PWM_MANUAL)
+        register = "pwm%d_enable" % channel
+        ok = write_sysfs(self._path(register), PWM_MANUAL)
         time.sleep(0.2)
-        return self._record_write(ok)
+        return self._record_write(channel, register, ok)
 
     def set_auto(self, channel):
         if self.dry_run:
             return True
+        register = "pwm%d_enable" % channel
         return self._record_write(
-            write_sysfs(self._path("pwm%d_enable" % channel), PWM_AUTOMATIC))
+            channel, register,
+            write_sysfs(self._path(register), PWM_AUTOMATIC))
 
     def set_pwm(self, channel, value):
         self.remember(channel)
         if self.dry_run:
             return True
+        register = "pwm%d" % channel
         return self._record_write(
-            write_sysfs(self._path("pwm%d" % channel), clamp_pwm(value)))
+            channel, register,
+            write_sysfs(self._path(register), clamp_pwm(value)))
 
     def restore(self, channel):
-        """Return one channel to exactly the state observed before this run."""
+        """Return one channel to exactly the state observed before this run.
+
+        True only when the mode register reads back as the mode that was asked
+        for. The verdict is deliberately not the last word - the aggregate
+        safe_state() around every hardware-mutating command is, and it covers
+        this channel because borrowing one remembers it - but a restore that
+        did not land is the first sign of a chip that will not take the fans
+        back, and this used to report nothing at all. A probe that spun a
+        channel up and could not put it down again looked exactly like one
+        that had never run.
+        """
         original = self._original.get(channel)
         if original is None or self.dry_run:
-            return
+            return True
+        wrote_duty = True
         target = original.get("pwm")
         if target is not None:
-            write_sysfs(self._path("pwm%d" % channel), clamp_pwm(target))
+            wrote_duty = write_sysfs(self._path("pwm%d" % channel),
+                                     clamp_pwm(target))
             if original.get("enable") == PWM_MANUAL and clamp_pwm(target) < PWM_FLOOR:
                 log("WARN channel %d was already in manual mode below the duty "
                     "floor (%s); restoring it as found" % (channel, target))
         mode = original.get("enable")
-        write_sysfs(self._path("pwm%d_enable" % channel),
-                    PWM_AUTOMATIC if mode is None else mode)
+        mode = PWM_AUTOMATIC if mode is None else mode
+        wrote_mode = write_sysfs(self._path("pwm%d_enable" % channel), mode)
+        readback = self.enable_mode(channel)
+        if wrote_duty and wrote_mode and readback == mode:
+            return True
+        log("WARN channel %d was not proven back in the state it was found in "
+            "(duty %s, mode %s, reads back as %s); the safe state on the way "
+            "out is what has to prove it"
+            % (channel, "ok" if wrote_duty else "failed",
+               "ok" if wrote_mode else "failed",
+               "unreadable" if readback is None else readback))
+        return False
+
+    def touched_channels(self):
+        """Channels whose registers were snapshotted, so possibly written."""
+        return sorted(self._original)
+
+    def _restore_one(self, channel):
+        """Put one channel back and prove it. True only when proven.
+
+        The proof is the `pwmN_enable` readback, and it has to be exactly
+        PWM_AUTOMATIC. "Unreadable" is not a pass: this used to accept None
+        alongside PWM_AUTOMATIC, so a channel whose registers had stopped
+        answering - the one case where a fan is most likely to be parked at a
+        stall duty with nobody in charge - was logged as "-> automatic mode".
+
+        A write that reports failure fails the channel even when the readback
+        happens to say automatic. The two answers come from the same register
+        interface: if it is refusing writes, its reads are not evidence either.
+        """
+        wrote_duty = write_sysfs(self._path("pwm%d" % channel), SAFE_PWM)
+        wrote_mode = write_sysfs(self._path("pwm%d_enable" % channel),
+                                 PWM_AUTOMATIC)
+        mode = self.enable_mode(channel)
+        if not (wrote_duty and wrote_mode):
+            log("ALERT channel %d did not accept the safe-state write "
+                "(duty %s, mode %s); it reads back as %s"
+                % (channel, "ok" if wrote_duty else "failed",
+                   "ok" if wrote_mode else "failed",
+                   "unreadable" if mode is None else mode))
+            return False
+        if mode != PWM_AUTOMATIC:
+            log("ALERT channel %d is %s after the safe state, not automatic "
+                "mode (%d); check the fan manually"
+                % (channel,
+                   "unreadable" if mode is None else "still in mode %d" % mode,
+                   PWM_AUTOMATIC))
+            return False
+        log("  channel %d -> automatic mode (verified)" % channel)
+        return True
+
+    @staticmethod
+    def _unmask_stop_signals(blocked):
+        """Put the signal mask back without letting a pending stop escape.
+
+        SIG_SETMASK delivers every stop signal that arrived while the restore
+        was running, and this program's handler turns each one into
+        Terminated. Raised from here it unwinds straight out of safe_state(),
+        past the aggregate verdict, and main() then reports a signalled stop -
+        exit 0 - for a chip that may still be in manual mode. The signal is
+        not discarded: it is handed back to the caller, which decides what it
+        means once the verdict is settled.
+
+        The loop drains them. Each pending signal is delivered once and the
+        call is idempotent after the mask is back, so repeating it turns a
+        queue of stop signals into a queue of returns instead of leaving one
+        to surface at an arbitrary later bytecode. It is bounded by the number
+        of signals that can be queued this way.
+        """
+        if blocked is None:
+            return None
+        deferred = None
+        for _ in range(len(STOP_SIGNALS) + 1):
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+                break
+            except Terminated as exc:
+                if deferred is None:
+                    deferred = exc
+            except (OSError, ValueError):
+                break
+        return deferred
 
     def safe_state(self, channels=None, reason=""):
         """Force touched channels to full duty and chip-managed automatic mode.
+
+        Returns True only when every target channel was proven to be back in
+        automatic mode. No target at all is False, not a vacuous success: the
+        caller asked for a fan to be handed back and none was.
 
         Called from `finally` blocks and after signals, so it must never raise
         and must not be interruptible half way: stop signals are blocked for
         its duration, otherwise a second Ctrl-C could abandon the restore with
         some channels still parked at a stall duty.
+
+        The verdict is computed, logged and recorded while they are still
+        blocked, and a stop signal delivered by the unmasking is returned
+        through `deferred_stop` rather than raised. Restoring the mask inside
+        a `finally` and evaluating the result after it meant a second SIGTERM
+        was delivered in the gap: `safe-state`, a stopping `run` and a
+        finishing `calibrate` all exited 0 on a chip they had just failed to
+        hand the fans back on, because main() saw only the signal.
         """
         targets = sorted(self._original) if channels is None else sorted(channels)
-        if not targets:
-            return
         if reason:
             log("SAFE-STATE %s" % reason)
+        if not targets:
+            log("ALERT safe state had no channel to restore; automatic mode "
+                "was not verified on anything")
+            record_unverified_handback("no channel to restore on %s"
+                                       % self.device)
+            return False
         if self.dry_run:
             log("SAFE-STATE dry run: channels %s left untouched" % targets)
-            return
+            return True
         try:
             blocked = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
         except (OSError, ValueError, AttributeError):
             blocked = None
-        try:
-            for channel in targets:
+        failed = []
+        deferred = None
+        for channel in targets:
+            # Every channel is attempted whatever the ones before it did:
+            # giving up on the first failure would leave the rest parked at
+            # whatever duty the interrupted run had them on.
+            proven = False
+            # Twice at most. A signal that arrived just before the mask went
+            # up has already set Python's pending flag, so its handler still
+            # fires in here; abandoning the channel on it would park a fan on
+            # the strength of a signal that changed nothing about the chip. A
+            # second interruption is taken as a refusal, so a signal storm
+            # cannot spin here.
+            for _ in range(2):
                 try:
-                    write_sysfs(self._path("pwm%d" % channel), SAFE_PWM)
-                    write_sysfs(self._path("pwm%d_enable" % channel),
-                                PWM_AUTOMATIC)
-                    # Read back: a silent restore failure is the one outcome
-                    # this whole mechanism exists to prevent.
-                    mode = self.enable_mode(channel)
-                    if mode not in (None, PWM_AUTOMATIC):
-                        log("ALERT channel %d is still in mode %s after the "
-                            "safe state; check the fan manually"
-                            % (channel, mode))
-                    else:
-                        log("  channel %d -> automatic mode" % channel)
+                    proven = self._restore_one(channel)
+                    break
+                except Terminated as exc:
+                    if deferred is None:
+                        deferred = exc
+                    log("WARN the safe state on channel %d was interrupted by "
+                        "%s; trying it again before the verdict"
+                        % (channel, exc))
                 except Exception as exc:  # noqa: BLE001 - last line of defence
                     log("WARN safe state failed on channel %d: %s"
                         % (channel, exc))
-        finally:
-            if blocked is not None:
-                try:
-                    signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-                except (OSError, ValueError):
-                    pass
+                    break
+            if not proven:
+                failed.append(channel)
+        if failed:
+            log("ALERT %d of %d channels could not be confirmed back in "
+                "automatic mode: %s" % (len(failed), len(targets), failed))
+            record_unverified_handback("channels %s on %s"
+                                       % (failed, self.device))
+        # Only here, with the verdict computed, logged and recorded, may the
+        # stop signals through again.
+        pending = self._unmask_stop_signals(blocked)
+        if deferred is None:
+            deferred = pending
+        if deferred is not None:
+            if self.deferred_stop is None:
+                self.deferred_stop = deferred
+            if failed:
+                log("ALERT %s arrived during the safe state; it does not turn "
+                    "an unverified handback into a clean stop" % deferred)
+        return not failed
 
     class _Borrowed:
         def __init__(self, controller, channel):
@@ -499,8 +835,14 @@ class FanController:
             if exc_type is not None and issubclass(exc_type, (Terminated, FanError)):
                 self.controller.safe_state([self.channel],
                                            reason="probe interrupted")
-            else:
-                self.controller.restore(self.channel)
+            elif not self.controller.restore(self.channel):
+                # Not fatal here on purpose: every command that borrows a
+                # channel does so inside an aggregate safe_state() scope that
+                # covers it, and that verdict is the one the exit status is
+                # built on. What must not happen is this passing in silence,
+                # which is what an unchecked restore() did.
+                log("WARN channel %d was borrowed and not proven back; the "
+                    "safe state on the way out has to prove it" % self.channel)
             return False
 
     def borrowed(self, channel):
@@ -573,6 +915,22 @@ def require_root():
         raise FanError("root privileges are required to write fan registers")
 
 
+def finish_or_stop(controller, code):
+    """Return `code`, unless the safe state deferred a stop signal.
+
+    safe_state() catches the signal its own unmasking delivers instead of
+    letting it unwind past the verdict, and it is called from `finally`
+    blocks, where re-raising would replace whatever exception brought the
+    command down and hide it. Here the verdict is settled and nothing else is
+    unwinding, so the signal can finally do what a stop signal does: main()
+    logs it and exits 0 - and only because the handback above was proven,
+    since main() consults the record before believing any of that.
+    """
+    if controller.deferred_stop is not None:
+        raise controller.deferred_stop
+    return code
+
+
 def install_signal_handlers():
     """Install stop handlers. Must run before the first register write."""
     def handler(signum, _frame):
@@ -640,23 +998,53 @@ def cmd_status(args):
 
 
 def cmd_safe_state(args):
-    """Force every channel to automatic mode.
+    """Force every channel to automatic mode, and prove it.
 
     Used as ExecStopPost so that a SIGKILL, an OOM kill or a crashed
-    interpreter still ends with the chip back in charge of the fans.
+    interpreter still ends with the chip back in charge of the fans, and by
+    scripts/install.sh and scripts/uninstall.sh as the gate in front of every
+    removal of a fan recovery artifact. All of them read the exit status as
+    "the fans are demonstrably back under the chip", so it is nonzero unless
+    every controllable channel was written and read back as automatic.
+
+    Deliberately takes no lock: this is the emergency recovery, and an
+    emergency recovery that can be blocked by the thing it is recovering from
+    is not one. It can therefore fight a running control loop over the same
+    registers - stop the service first unless this really is a recovery.
     """
     require_root()
     device = find_device(args.device_glob)
     controller = FanController(device, dry_run=args.dry_run)
     channels = [c for c in controller.channels() if controller.controllable(c)]
     if not channels:
-        log("no controllable channels on %s" % device)
-        return 0
+        # Nothing to restore is not the same as nothing to worry about: a chip
+        # that exposes no writable duty register is one this program cannot
+        # hand the fans back on, so it must not report that it did.
+        log("ERROR no controllable channel on %s; automatic fan mode could "
+            "not be verified" % device)
+        return 1
+    if args.dry_run:
+        # A dry run writes no register and reads none back. It therefore knows
+        # nothing about where the fans are, and saying so is the whole job
+        # here: this command's exit status is what scripts/install.sh,
+        # scripts/uninstall.sh and the documented manual procedures gate a
+        # `rm` on. Exiting 0 after proving nothing would hand every one of
+        # them a way to delete the fan binary by adding a flag.
+        log("dry run: would write duty %d and mode %d to channels %s on %s"
+            % (SAFE_PWM, PWM_AUTOMATIC, channels, device))
+        log("no register was written and none was read back, so nothing was "
+            "proven about the fans")
+        log("exit status %d means previewed-only; only exit 0 is a handback "
+            "you may delete a fan binary on" % EXIT_NOT_VERIFIED)
+        return EXIT_NOT_VERIFIED
     # No prior snapshot exists in this process, so name the channels directly.
     for channel in channels:
         controller.remember(channel)
-    controller.safe_state(channels, reason="requested via safe-state")
-    return 0
+    if not controller.safe_state(channels, reason="requested via safe-state"):
+        log("ERROR automatic fan mode could not be verified on %s" % device)
+        return 1
+    log("automatic fan mode verified on channels %s" % channels)
+    return finish_or_stop(controller, 0)
 
 
 def cmd_validate_cache(args):
@@ -682,15 +1070,33 @@ def cmd_validate_cache(args):
 
 
 def _settle(controller, channel, seconds, temp_path, stall_started=None):
-    """Wait, while watching for an overheat or an over-long stall.
+    """Wait, while watching for an overheat, a lost sensor or a long stall.
 
     Sleeping in short slices keeps the abort responsive; a plain time.sleep()
     would happily sit through a thermal excursion with the fan stopped.
+
+    Every sample is validated, not just the ones that arrive. The sweep below
+    lowers the duty until the fan stops, so the reading is the only thing
+    standing between "measuring the stall point" and "holding a stopped fan on
+    a machine nobody is watching the temperature of". A sample that is missing,
+    unparseable, NaN, infinite or outside the documented plausible band ends
+    the calibration immediately: there is no safe way to take the next step
+    down blind, and a retry loop would be more time at the current duty.
     """
+    # A dry run writes no register, so there is no duty being lowered and no
+    # reason to demand a sensor from a host that may not have one. This is the
+    # only case cmd_calibrate lets through without a temperature input.
+    watching = not (controller.dry_run and temp_path is None)
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
-        temp = read_temp(temp_path)
+        temp = read_temp(temp_path) if watching else None
+        if watching and not temperature_is_plausible(temp):
+            raise FanError(
+                "aborting calibration: the temperature sensor stopped giving "
+                "usable readings (%s) while channel %d was being swept. The "
+                "fan is not being lowered any further without it."
+                % ("no reading" if temp is None else "%r" % (temp,), channel))
         if temp is not None and temp >= CALIBRATION_ABORT_TEMP:
             raise FanError(
                 "aborting calibration: temperature reached %d C (limit %d C)"
@@ -705,6 +1111,40 @@ def _settle(controller, channel, seconds, temp_path, stall_started=None):
                                          CALIBRATION_MAX_STALL_S))
 
 
+def command_manual(controller, channel):
+    """Put one channel into manual mode for calibration, or abort.
+
+    Calibration owns the duty register for the whole sweep. A chip that did
+    not take the manual-mode command is still running its own automatic
+    curve, so every duty written afterwards is a suggestion, every RPM read
+    back describes the chip's decisions rather than this program's, and the
+    numbers that come out the other end are a measurement of nothing.
+    """
+    if controller.set_manual(channel):
+        return
+    raise FanError(
+        "aborting calibration: channel %d did not accept the manual-mode "
+        "command. Nothing was measured and nothing was saved." % channel)
+
+
+def command_duty(controller, channel, duty, what):
+    """Command one calibration duty, or abort.
+
+    In the control loop a refused write is a retry-next-cycle event: the fan
+    stays where it is, which is somewhere it was already running. In a
+    calibration sweep the next step is *lower*, so continuing after a refusal
+    means stepping a fan towards its stall point without knowing what duty it
+    is actually on. There is no safe way to do that, so the first refusal
+    ends the sweep and the caller hands the fans back.
+    """
+    if controller.set_pwm(channel, duty):
+        return
+    raise FanError(
+        "aborting calibration: channel %d did not accept the %s duty %d. The "
+        "chip is not acknowledging commands, so the fan's real duty is "
+        "unknown and the sweep will not step down blind." % (channel, what, duty))
+
+
 def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
     """Measure max RPM, stall duty and restart duty for one channel.
 
@@ -714,9 +1154,9 @@ def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
     log("")
     log("=== calibrating fan%d ===" % channel)
     result = {"stall_duty": None}
-    controller.set_manual(channel)
+    command_manual(controller, channel)
 
-    controller.set_pwm(channel, PWM_MAX)
+    command_duty(controller, channel, PWM_MAX, "full-speed")
     _settle(controller, channel, spin, temp_path)
     result["max_rpm"] = controller.rpm(channel)
     log("  max RPM at duty %d: %s" % (PWM_MAX, result["max_rpm"]))
@@ -727,7 +1167,7 @@ def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
     log("  searching stall duty (the fan will stop)...")
     last_spinning = PWM_MAX
     for duty in range(120, CALIBRATION_SWEEP_MIN - 1, -5):
-        controller.set_pwm(channel, duty)
+        command_duty(controller, channel, duty, "descending-sweep")
         _settle(controller, channel, settle, temp_path)
         rpm = controller.rpm(channel)
         if rpm > 0:
@@ -748,7 +1188,7 @@ def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
 
     log("  searching restart duty...")
     stall_started = time.monotonic()
-    controller.set_pwm(channel, PWM_MIN)
+    command_duty(controller, channel, PWM_MIN, "zero")
     _settle(controller, channel, 2, temp_path, stall_started=stall_started)
     minstart = None
     # Start from just below the measured stall point rather than from a fixed
@@ -756,7 +1196,7 @@ def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
     # step is airflow the machine does not have.
     start_duty = max(PWM_FLOOR, clamp_pwm(result["stall_duty"] - 10))
     for duty in range(start_duty, PWM_MAX + 1, 5):
-        controller.set_pwm(channel, duty)
+        command_duty(controller, channel, duty, "restart")
         _settle(controller, channel, settle, temp_path,
                 stall_started=stall_started)
         if controller.rpm(channel) > 0:
@@ -769,13 +1209,15 @@ def calibrate_channel(controller, channel, temp_path, settle=3.0, spin=4.0):
     result["minstart"] = max(clamp_pwm(minstart + 10), result["minstop"])
     log("  restart duty %d -> %d with margin" % (minstart, result["minstart"]))
 
-    controller.set_pwm(channel, result["minstop"])
+    command_duty(controller, channel, result["minstop"], "final-minimum")
     _settle(controller, channel, settle, temp_path)
     result["min_rpm"] = controller.rpm(channel)
     log("  RPM at duty %d: %s" % (result["minstop"], result["min_rpm"]))
 
-    # Leave the channel cooling before moving to the next one.
-    controller.set_pwm(channel, SAFE_PWM)
+    # Leave the channel cooling before moving to the next one. Gated like
+    # every other write here: a chip that will not take full duty at the end
+    # of a sweep is one the next channel must not be swept on either.
+    command_duty(controller, channel, SAFE_PWM, "cool-down")
     return result
 
 
@@ -797,7 +1239,7 @@ def cmd_calibrate(args):
             "needs a temperature reading to abort safely; refusing to run "
             "blind." % args.sensor)
     start_temp = read_temp(temp_path)
-    if start_temp is None and not args.dry_run:
+    if not temperature_is_plausible(start_temp) and not args.dry_run:
         raise FanError("temperature sensor '%s' is unreadable; refusing to run"
                        % args.sensor)
     if start_temp is not None and start_temp > CALIBRATION_START_MAX_TEMP:
@@ -807,35 +1249,51 @@ def cmd_calibrate(args):
     log("starting temperature: %s"
         % ("N/A" if start_temp is None else "%d C" % start_temp))
 
-    # Handlers and lock before the first write, not after.
+    # Handlers and locks before the first write, not after. The locks are
+    # named after the controller, so an operator calibrating with one --cache
+    # still contends with the service loop running from another.
     install_signal_handlers()
-    lock = acquire_lock(lock_path_for(args.cache))
-
-    existing = None
-    try:
-        existing = load_cache(args.cache)
-    except FanError as exc:
-        log("WARN %s - it will be replaced" % exc)
-
-    channels = args.channels or controller.detect_active(probe=args.probe)
-    channels = [c for c in channels if controller.controllable(c)]
-    if not channels:
-        raise FanError(
-            "no controllable fan channel is spinning. Use --probe to spin up "
-            "silent channels, or --channels to name them explicitly.")
-    log("channels to calibrate: %s" % channels)
-
-    if existing and sorted(existing["channels"]) == sorted(channels) and not args.force:
-        log("cached calibration already matches channels %s; use --force to redo"
-            % channels)
-        return 0
+    locks = acquire_writer_locks(device)
 
     results = {}
     outcome = "aborted"
+    restored = False
+    up_to_date = False
+    # Opened before the first thing that can write a register and closed after
+    # the last one. --probe puts a silent channel into manual mode at full
+    # duty in order to find out whether a fan is attached to it, and that is a
+    # hardware-mutating calibration action like any other. It used to run in
+    # front of this block, with nothing but _Borrowed's unchecked restore()
+    # behind it, so a chip that accepted the probe and then refused automatic
+    # mode left calibration through one of the two exits below - "nothing is
+    # spinning" and "the cache already matches" - having proven nothing and
+    # aggregated nothing.
     try:
-        for channel in channels:
-            results[channel] = calibrate_channel(controller, channel, temp_path)
-        outcome = "finished"
+        existing = None
+        try:
+            existing = load_cache(args.cache)
+        except FanError as exc:
+            log("WARN %s - it will be replaced" % exc)
+
+        channels = args.channels or controller.detect_active(probe=args.probe)
+        channels = [c for c in channels if controller.controllable(c)]
+        if not channels:
+            raise FanError(
+                "no controllable fan channel is spinning. Use --probe to spin "
+                "up silent channels, or --channels to name them explicitly.")
+        log("channels to calibrate: %s" % channels)
+
+        if existing and sorted(existing["channels"]) == sorted(channels) \
+                and not args.force:
+            log("cached calibration already matches channels %s; use --force "
+                "to redo" % channels)
+            outcome = "not needed"
+            up_to_date = True
+        else:
+            for channel in channels:
+                results[channel] = calibrate_channel(controller, channel,
+                                                     temp_path)
+            outcome = "finished"
     except Terminated as exc:
         outcome = "interrupted by %s" % exc
         raise FanError("calibration interrupted by %s before completion" % exc)
@@ -843,8 +1301,42 @@ def cmd_calibrate(args):
         # Runs on success too: a sweep that visited stall duties must never
         # leave the chip in manual mode. The reason is reported accurately so
         # the journal does not claim a clean finish after an interruption.
-        controller.safe_state(reason="calibration %s" % outcome)
-        lock.close()
+        # The locks come off in a nested `finally` so that releasing them
+        # never depends on safe_state() returning at all.
+        try:
+            if controller.touched_channels():
+                restored = controller.safe_state(
+                    reason="calibration %s" % outcome)
+                if not restored:
+                    # Said here as well as below, because below is only
+                    # reached when the sweep itself succeeded. When an abort
+                    # is already on its way out, this is the only place the
+                    # cleanup failure gets reported.
+                    log("ALERT the calibration cleanup could not be confirmed; "
+                        "the fans are NOT proven back in the chip's automatic "
+                        "mode. Recover with: qnap-tsx70-fancontrol safe-state")
+            else:
+                # Not one register was written - no probe, no sweep - so there
+                # is no handback to prove. Deliberately not routed through
+                # safe_state(): "no target" there means a caller asked for a
+                # fan to be handed back and got none, which is a failure, and
+                # this is not that.
+                log("no fan register was written, so there is nothing to hand "
+                    "back")
+                restored = True
+        finally:
+            release_locks(locks)
+    if not restored:
+        # The sweep deliberately parked this fan at duties it does not turn
+        # at. Nothing below may run - not the analysis, not the save, and
+        # certainly not the "start the service when you are ready" line - on a
+        # machine whose fans are in an unknown state.
+        raise FanError(
+            "calibration ended with channels that could not be confirmed back "
+            "in the chip's automatic mode; the results were NOT saved. Restore "
+            "the fans first: qnap-tsx70-fancontrol safe-state")
+    if up_to_date:
+        return finish_or_stop(controller, 0)
 
     usable, rejected = {}, []
     for channel, result in results.items():
@@ -873,7 +1365,7 @@ def cmd_calibrate(args):
                values["minstop"], PWM_MAX, values["minstart"]))
     log("")
     log("Start the service when you are ready: systemctl start qnap-tsx70-fancontrol")
-    return 0
+    return finish_or_stop(controller, 0)
 
 
 def cmd_run(args):
@@ -900,7 +1392,7 @@ def cmd_run(args):
                        "control loop without a temperature input" % args.sensor)
 
     install_signal_handlers()
-    lock = acquire_lock(lock_path_for(args.cache))
+    locks = acquire_writer_locks(device)
     log("qnap-tsx70-fancontrol %s starting" % VERSION)
     log("  controller : %s" % device)
     log("  channels   : %s" % channels)
@@ -915,9 +1407,19 @@ def cmd_run(args):
     kickstarts = {c: 0 for c in channels}
     temp_failures = 0
     clean_exit = False
+    restored = False
     try:
-        for channel in channels:
-            controller.set_manual(channel)
+        # Every channel is attempted before the verdict, so a chip that
+        # refuses two of three is reported as refusing two of three and all
+        # three are remembered for the safe state. Entering the loop without
+        # checking meant a channel still on the chip's own automatic curve was
+        # driven for the rest of the run as though this program owned it.
+        refused = [c for c in channels if not controller.set_manual(c)]
+        if refused:
+            raise FanError(
+                "channels %s did not accept the manual-mode command, so this "
+                "program is not in control of them; refusing to run a curve "
+                "against registers the chip is ignoring" % refused)
 
         while True:
             temp = read_temp(temp_path)
@@ -963,21 +1465,42 @@ def cmd_run(args):
                     kickstarts[channel] = 0
                     controller.set_pwm(channel, target)
 
-            if controller.write_failures >= WRITE_FAILURE_LIMIT:
+            # Per channel and per register: one fan answering every command
+            # is not evidence about the one next to it that answers none.
+            exhausted = controller.exhausted_writes(WRITE_FAILURE_LIMIT)
+            if exhausted:
                 raise FanError(
-                    "%d consecutive register writes failed; the controller is "
-                    "not accepting commands" % controller.write_failures)
+                    "the controller is not accepting commands: %s. Failing "
+                    "safe rather than running a curve against registers that "
+                    "refuse it"
+                    % "; ".join("%s refused %d consecutive writes"
+                                % (register, count)
+                                for _, register, count in exhausted))
             time.sleep(args.interval)
     except Terminated as exc:
         log("stopping on %s" % exc)
         clean_exit = True
-        return 0
     finally:
         # Unconditional: covers the clean stop, FanError, and any unexpected
-        # exception on the way out.
-        controller.safe_state(
-            reason="service stopping" if clean_exit else "control loop failed")
-        lock.close()
+        # exception on the way out. The verdict is kept rather than returned
+        # from here, because returning out of a `finally` would swallow the
+        # FanError that brought the loop down. The locks come off in a nested
+        # `finally` so that releasing them never depends on safe_state()
+        # returning at all.
+        try:
+            restored = controller.safe_state(
+                reason="service stopping" if clean_exit else "control loop failed")
+        finally:
+            release_locks(locks)
+    # Reached only on the clean stop; every other path left through `finally`
+    # with its own exception. A stop that could not hand the fans back is not
+    # a clean stop, whatever the signal said - including a second signal
+    # delivered while the safe state was putting the mask back.
+    if not restored:
+        raise FanError(
+            "stopped, but the fans could not be confirmed back in the chip's "
+            "automatic mode. Check them now: qnap-tsx70-fancontrol status")
+    return finish_or_stop(controller, 0)
 
 
 def build_parser():
@@ -1043,12 +1566,25 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    reset_handback_record()
     try:
-        return args.func(args)
+        code = args.func(args)
     except FanError as exc:
         log("ERROR %s" % exc)
         return 1
     except Terminated as exc:
+        # A stop signal is a normal way for this program to end. It is not a
+        # normal way to end with a fan in manual mode, and this branch used to
+        # be how that happened: safe_state() unmasked the stop signals inside
+        # a `finally`, the second one was delivered there, and the exception
+        # it raised unwound past the failed verdict to here, where it was
+        # reported as a clean stop. The verdict is recorded before the mask
+        # comes down precisely so that it is still readable from here.
+        if handback_unverified():
+            log("ERROR stopped by %s, but the fans were NOT confirmed back in "
+                "the chip's automatic mode (%s). Check them now: "
+                "qnap-tsx70-fancontrol safe-state" % (exc, handback_detail()))
+            return 1
         log("stopped by %s" % exc)
         return 0
     except PermissionError as exc:
@@ -1059,6 +1595,17 @@ def main(argv=None):
             log("ERROR missing path: %s" % exc)
             return 1
         raise
+    if code == 0 and handback_unverified():
+        # Restating the rule over the exit status itself. No current ordering
+        # can reach this - every command that runs a safe state raises or
+        # returns nonzero on a false verdict of its own - so this is not where
+        # the protection lives. It is here so that a new command, or a moved
+        # gate, fails closed instead of quietly reporting success on a chip
+        # that was never proven back.
+        log("ERROR exiting nonzero: the fans were NOT confirmed back in the "
+            "chip's automatic mode (%s)" % handback_detail())
+        return 1
+    return code
 
 
 if __name__ == "__main__":

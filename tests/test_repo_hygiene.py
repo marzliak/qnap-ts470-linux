@@ -344,8 +344,8 @@ class DocumentedInterfaceTests(unittest.TestCase):
         # Option-table rows in the guide also cover install.sh, uninstall.sh
         # and diagnose.sh.
         external = {"--lcd", "--with-fan-control", "--dry-run", "--no-migrate",
-                    "--skip-deps", "--force", "--purge", "--keep-modules",
-                    "--with-smart", "--output", "--now"}
+                    "--skip-deps", "--force", "--allow-serial-owner", "--purge",
+                    "--keep-modules", "--with-smart", "--output", "--now"}
         unknown = documented - known - external
         self.assertEqual(unknown, set(),
                          "documented but unparsed LCD flags: %s" % unknown)
@@ -353,8 +353,24 @@ class DocumentedInterfaceTests(unittest.TestCase):
     def test_installer_flags_are_documented_in_its_own_help(self):
         body = read("scripts/install.sh")
         for flag in ("--lcd", "--with-fan-control", "--dry-run", "--no-migrate",
-                     "--skip-deps", "--force"):
+                     "--skip-deps", "--force", "--allow-serial-owner"):
             self.assertIn(flag, body)
+
+    def test_every_installer_flag_reaches_the_guide(self):
+        """The reverse direction: the guide's option table must be complete.
+
+        --allow-serial-owner shipped without appearing in it, so the one
+        documented way past a busy serial port was documented nowhere the
+        reader looks for installer options.
+        """
+        body = read("scripts/install.sh")
+        usage = body.split("<<'USAGE'\n", 1)[1].split("\nUSAGE\n", 1)[0]
+        parsed = set(self.FLAG.findall(usage)) - {"--help"}
+        guide = read("docs/LCD_GUIDE.md")
+        missing = sorted(flag for flag in parsed if flag not in guide)
+        self.assertEqual(missing, [],
+                         "installer flags missing from docs/LCD_GUIDE.md: %s"
+                         % missing)
 
 
 if __name__ == "__main__":

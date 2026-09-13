@@ -156,11 +156,17 @@ installer's own lifecycle above is what is supposed to get this right.
 ### Uninstalling with fan control running
 
 `scripts/uninstall.sh` stops the fan service before it removes anything, and
-verifies both that systemd reports the unit inactive and that no fan-control
-process is left. If either check fails it removes **nothing** and tells you how
-to recover. That is deliberate: deleting the unit and the binary while a writer
-is still driving PWM leaves a process systemd no longer knows about and no
-executable left to restore the chip's automatic mode.
+verifies three things: that systemd reports the unit inactive, that no
+fan-control process is left, and that `safe-state` then confirmed the chip is
+back in its own automatic mode. If any of them fails it removes **nothing** —
+in particular it keeps the fan binary and its unit — and tells you how to
+recover. That is deliberate: deleting the unit and the binary while a writer is
+still driving PWM leaves a process systemd no longer knows about and no
+executable left to restore the chip's automatic mode, and deleting them after
+an unconfirmed safe state leaves the chip in manual mode with the same result.
+
+To remove fan control but keep the LCD, use `--fan-only`; see
+[§10](#10-uninstalling-just-fan-control).
 
 ---
 
@@ -230,14 +236,62 @@ automatic mode. Run this if anything ever leaves your fan in a state you do not
 like. It is also wired as `ExecStopPost=` on the service, so a `SIGKILL` or an
 OOM kill still ends with the chip in charge.
 
+**The exit status is a verdict, not a receipt.** It is 0 only when every
+controllable channel was written *and* read back as `pwmN_enable = 2`. A write
+the chip refused, a register that will not answer, a channel still in manual
+mode, or a chip with no controllable channel at all each exit nonzero and say
+which channel and why. `scripts/install.sh` and `scripts/uninstall.sh` gate
+every removal or replacement of a fan binary or unit on that exit status, so
+scripts may do the same.
+
+| Exit | Meaning |
+|---|---|
+| 0 | every controllable channel was written and read back as automatic mode. This, and only this, is a verified handback |
+| 1 | it could not be proven: a refused write, an unreadable register, a channel still in manual mode, no controllable channel, or no controller at all |
+| 2 | usage error from the command line |
+| 3 | `--dry-run`: nothing was written, nothing was read back, nothing was proven |
+
+**`--dry-run` is a preview, not a hardware check.** It writes no register and
+reads none back, so it cannot know where the fans are, and it says so rather
+than reporting a verified handback. It exits **3** for exactly that reason: a
+caller that gates a deletion on `safe-state && rm` must not be able to earn
+the `rm` by adding a flag. Treat anything other than 0 as "do not delete".
+
 Unlike `run` and `calibrate`, this command deliberately does **not** take the
-lock, so it always works as an emergency recovery. That means it can fight a
-running control loop over the same registers — stop the service first unless
-this genuinely is a recovery:
+writer lock, so it always works as an emergency recovery — a recovery that can
+be blocked by the thing it is recovering from is not one. That means it can
+fight a running control loop over the same registers, so stop the service
+first unless this genuinely is a recovery:
 
 ```bash
 sudo systemctl stop qnap-tsx70-fancontrol
 ```
+
+### The writer lock
+
+`run` and `calibrate` are writers and hold a lock for their whole run;
+`status`, `validate-cache` and `safe-state` do not take one.
+
+The lock is named after the **physical controller**, not after the calibration
+file, and lives under `/run/qnap-tsx70`:
+
+```
+/run/qnap-tsx70/fancontrol.lock                     taken by every writer
+/run/qnap-tsx70/fancontrol-f71882fg.2592.lock       the controller's own
+```
+
+Both are taken, in that order. `--cache` cannot move either of them, which is
+the point: it used to place the lock beside whatever `--cache` named, so
+
+```bash
+systemctl start qnap-tsx70-fancontrol                    # locked /var/lib/...
+qnap-tsx70-fancontrol calibrate --yes --cache /tmp/c     # locked /tmp/...
+```
+
+were two writers on the same PWM registers, each holding a lock the other
+never looked at — while the calibration sweep was deliberately driving a fan
+towards its stall point. The first lock is what a writer that cannot resolve a
+controller takes on its own, so it can never race one that can.
 
 ---
 
@@ -264,11 +318,14 @@ stops, then raises it again until it starts. During that window the machine has
 |---|---|
 | Hot start | Refuses to begin above 60 °C |
 | Thermal abort | Aborts and fails safe at 70 °C during the sweep |
+| Lost telemetry | Every settle sample is validated; a missing, unparseable, NaN, infinite or out-of-band reading aborts the sweep immediately, before the duty is lowered again |
+| Refused control write | Every control write is a gate: manual mode, the spin-up, each step of the descent, the zero duty, each step of the restart search, the measured minimum and the cool-down. The first one the chip does not acknowledge aborts the sweep, because the next step is always *lower* and taking it would be stepping the fan towards its stall point without knowing what duty it is on. Nothing is analysed and nothing is saved |
 | Stall cap | Aborts if a fan sits at 0 RPM longer than 45 s |
+| `--probe` | Spinning a silent channel up is a register write like any other, so it happens inside the same cleanup scope as the sweep. Every channel the probe touched is handed back and read back, including one it decided has no fan on it; a probe that cannot be undone exits nonzero, saves nothing and recommends nothing |
 | Signals | `SIGTERM`, `SIGINT` (Ctrl-C), `SIGHUP` (SSH disconnect) and `SIGQUIT` all fail safe |
-| Lock | An interactive calibration and the service cannot run at once |
+| Lock | An interactive calibration and the service cannot run at once, whatever `--cache` each was given: the lock names the controller, not the file |
 | Degenerate results | A sweep on a fan that never turned is discarded, not saved |
-| Exit path | Success, failure, exception and signal all force full duty plus automatic mode, then read the register back to confirm |
+| Exit path | Success, failure, exception and signal all force full duty plus automatic mode, then read the register back to confirm. A restore that cannot be confirmed exits nonzero and the calibration is not saved |
 
 `SIGHUP` matters more than it sounds: calibrating over SSH and losing the
 connection is the most likely real-world interruption.
@@ -288,12 +345,15 @@ connection is the most likely real-world interruption.
 | Condition | Response |
 |---|---|
 | Temperature unreadable | Full duty immediately; after 3 consecutive cycles, exit nonzero |
-| 3 consecutive register write failures | Safe state, exit nonzero |
+| Manual mode refused at startup | Every channel is attempted, then the loop refuses to start: a channel still on the chip's own curve is not one this program controls |
+| 3 consecutive register write failures | Safe state, exit nonzero. Counted **per channel and per register**, so a healthy fan answering its own commands cannot mask a dead one beside it |
 | Fan not turning | Kickstart at the calibrated restart duty; escalate to full duty after 2 attempts; after 6, exit nonzero |
 | Controller ambiguous or missing | Refuse to start; no register is written |
 | No calibration stored | Refuse to start |
 | Corrupt or hand-edited calibration | Values re-clamped to the duty floor on load |
-| `SIGTERM` from systemd | Safe state, exit 0 |
+| `SIGTERM` from systemd | Safe state, exit 0 — but only if the safe state was confirmed; an unconfirmed one exits nonzero |
+| A second stop signal during the safe state | Stop signals are blocked while the channels are put back, so a second one is delivered when that mask is lifted. The verdict is decided and recorded first, and the signal is re-raised afterwards: a confirmed handback still ends as a normal signalled stop, an unconfirmed one still exits nonzero |
+| Safe state not confirmed on the way out | Exit nonzero, with the channel and the reason logged |
 | Unhandled exception | Safe state, exit nonzero |
 | `SIGKILL` / OOM kill | `ExecStopPost=` runs `safe-state` |
 
@@ -355,15 +415,50 @@ That is the safe state working as designed. Investigate the logged reason, then
 
 ## 10. Uninstalling just fan control
 
+Use the uninstaller. It takes a flag for exactly this:
+
 ```bash
-sudo systemctl disable --now qnap-tsx70-fancontrol
-sudo rm /etc/systemd/system/qnap-tsx70-fancontrol.service
-sudo rm /usr/local/bin/qnap-tsx70-fancontrol
-sudo systemctl daemon-reload
+sudo ./scripts/uninstall.sh --fan-only
 ```
 
-Stopping the service restores the chip's automatic mode. The LCD service is
-independent and is unaffected.
+It removes `/usr/local/bin/qnap-tsx70-fancontrol`, its unit and
+`/etc/modules-load.d/qnap-tsx70.conf`, and leaves the LCD service, its unit and
+`/etc/qnap-tsx70-lcd.conf` exactly as they are. Add `--purge` to delete the
+stored calibration as well, or `--dry-run` to see what it would do first.
+
+Nothing is deleted until all of these hold:
+
+1. `systemctl stop` succeeded **and** systemd then reported the unit inactive —
+   `activating` and `deactivating` count as active, not as stopped;
+2. no fan-control process is left, judged by the command word in its argv, so
+   `run --sensor status` is a writer and a stray `status` is not;
+3. `qnap-tsx70-fancontrol safe-state` exited 0, which it does only when every
+   controllable channel reads back as automatic mode.
+
+If any of them fails the run stops, the binary and the unit stay where they
+are, and you are told how to recover. That is the point of them: those two
+files are the only way back once they are gone.
+
+`scripts/install.sh` applies the same third rule to itself. Before it replaces
+the fan binary and unit (`--with-fan-control` over an existing install) or
+deletes the legacy ones (a migration), it runs the repository copy of
+`qnap-tsx70-fancontrol safe-state` and continues only on exit 0. An install
+that is not replacing or deleting a fan recovery artifact — the ordinary
+LCD-only one — never writes to the fan controller at all. The manual migration
+and rollback procedures in [MIGRATION_FROM_SATURN.md](MIGRATION_FROM_SATURN.md)
+carry the same gate in front of their first `rm`.
+
+> **Do not hand-roll this as `systemctl disable --now` followed by `rm`.**
+> This guide used to, and it was wrong in three ways at once. `disable --now`
+> reports success for a unit that is still shutting down; it says nothing
+> about a fan process that outlived its unit; and it cannot tell you whether
+> the chip actually took the fans back. The `rm` then removed the one
+> executable that could have fixed any of that. If you must do it by hand,
+> run `sudo qnap-tsx70-fancontrol safe-state` first and delete nothing unless
+> it exits 0.
+
+The LCD service is independent: `--fan-only` does not stop it, disable it, or
+clear the display.
 
 ---
 

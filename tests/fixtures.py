@@ -10,6 +10,9 @@ this module supplies the other side of them:
   QNAP_TSX70_TEST_ROOT   a directory that stands in for /
   QNAP_TSX70_PROC_DIR    a directory that stands in for /proc
   QNAP_TSX70_KILL        a recorded stand-in for kill(1)
+  QNAP_TSX70_DEVICE_GLOB a disposable directory that stands in for the chip
+  QNAP_TSX70_FAN_BINARY  the shipped fan program, pointed at that chip
+  QNAP_TSX70_LOCK_DIR    a disposable directory that stands in for /run
   PATH                   fake systemctl, fuser and modprobe, ahead of the real ones
 
 The fake root is snapshotted by content and mode, which is what makes
@@ -71,6 +74,29 @@ def should_fail(verb, unit):
     return seen > skip
 
 
+def is_stuck(unit):
+    """A stop that reports success and leaves the unit up, from call N on.
+
+    Counted like should_fail: one run can stop the same fan unit twice - once
+    for the transition and once from inside a rollback - and a test has to be
+    able to say which of the two is the one that does not take.
+    """
+    marker = os.path.join(state, "stuck", unit)
+    if not os.path.exists(marker):
+        return False
+    with open(marker, encoding="utf-8") as fh:
+        skip = int((fh.read().strip() or "0"))
+    counter = os.path.join(state, "stuck", "count-%s" % unit)
+    seen = 0
+    if os.path.exists(counter):
+        with open(counter, encoding="utf-8") as fh:
+            seen = int(fh.read().strip() or "0")
+    seen += 1
+    with open(counter, "w", encoding="utf-8") as fh:
+        fh.write(str(seen))
+    return seen > skip
+
+
 def entry(units, unit):
     return units.get(unit)
 
@@ -108,6 +134,24 @@ if verb == "show":
     sys.exit(0)
 
 if verb == "daemon-reload":
+    # A writer can appear between one gate and the next; this is how a test
+    # gets one to show up at a chosen moment.
+    spawn = os.path.join(state, "spawn-on-reload.json")
+    if os.path.exists(spawn):
+        with open(spawn, encoding="utf-8") as fh:
+            spec = json.load(fh)
+        entry = os.path.join(proc_dir, str(spec["pid"]))
+        os.makedirs(entry, exist_ok=True)
+        with open(os.path.join(entry, "comm"), "w", encoding="utf-8") as fh:
+            fh.write(spec["comm"] + "\n")
+        with open(os.path.join(entry, "cmdline"), "wb") as fh:
+            fh.write(b"\0".join(a.encode() for a in spec["argv"]) + b"\0")
+        if spec.get("exe"):
+            link = os.path.join(entry, "exe")
+            if not os.path.lexists(link):
+                os.symlink(spec["exe"], link)
+        open(os.path.join(state, "linger", str(spec["pid"])), "w").close()
+        os.remove(spawn)
     if should_fail("daemon-reload", ""):
         print("Failed to reload: injected failure", file=sys.stderr)
         sys.exit(1)
@@ -146,7 +190,7 @@ if verb in ("stop", "start", "restart", "enable", "disable"):
     item = units.setdefault(unit, {"known": True})
     if verb == "stop":
         # "stuck" models a stop that reports success while the unit stays up.
-        if not os.path.exists(os.path.join(state, "stuck", unit)):
+        if not is_stuck(unit):
             item["active"] = False
             kill_procs(units, unit)
     elif verb in ("start", "restart"):
@@ -190,6 +234,13 @@ print(" ".join(live))
 sys.exit(0)
 '''
 
+# Answers once, exactly as FAKE_FUSER would, and then removes itself, so a
+# test can ask what the installer does when an inspection tool disappears
+# between preflight and the moment the port has to be confirmed free.
+FAKE_FUSER_SELF_DESTRUCT = FAKE_FUSER.replace(
+    "import json, os, sys",
+    "import json, os, sys\n\nos.remove(os.path.abspath(sys.argv[0]))", 1)
+
 FAKE_KILL = r'''#!/usr/bin/env python3
 """Fake kill: records the signal and removes the fake process, if it yields."""
 import os, sys
@@ -220,12 +271,90 @@ with open(os.path.join(state, "modprobe.log"), "a", encoding="utf-8") as fh:
 sys.exit(0)
 '''
 
+# The shipped fan binary, pointed at a disposable fake sysfs tree.
+#
+# The uninstaller's safe-state gate is only worth as much as what safe-state
+# actually verifies, so these tests run the real program rather than a stub
+# that exits 0. Three things are faked, and all three are seams rather than
+# rewrites: the device glob names a temporary directory, geteuid answers 0
+# because CI does not run as root, and named registers can be made to accept a
+# write and ignore it - which is what a chip that stays in manual mode does,
+# and what a plain file cannot be made to do.
+FAKE_FAN_BINARY = r'''#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+os.geteuid = lambda: 0
+
+loader = importlib.machinery.SourceFileLoader(
+    "fanctl_under_test", os.environ["FAKE_FAN_SOURCE"])
+spec = importlib.util.spec_from_loader("fanctl_under_test", loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+ignored = set(os.environ.get("FAKE_FAN_IGNORE_WRITES", "").split())
+failing = set(os.environ.get("FAKE_FAN_FAIL_WRITES", "").split())
+real_write = module.write_sysfs
+
+
+def write_sysfs(path, value):
+    name = os.path.basename(path)
+    if name in failing:
+        return False
+    if name in ignored:
+        return True
+    return real_write(path, value)
+
+
+module.write_sysfs = write_sysfs
+
+with open(os.environ["FAKE_FAN_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\n")
+
+sys.exit(module.main(sys.argv[1:]
+                     + ["--device-glob", os.environ["FAKE_FAN_DEVICE_GLOB"]]))
+'''
+
 MUTATING_VERBS = ("stop", "start", "restart", "enable", "disable",
                   "daemon-reload")
 
 VALID_CACHE = json.dumps({"version": 1, "channels": [1],
                           "fans": {"1": {"minstop": 90, "minstart": 120,
                                          "min_rpm": 400, "max_rpm": 1800}}})
+
+
+_SANITISED_PATHS = {}
+
+
+def path_without(*names):
+    """A PATH like this host's, minus some commands. Built once per process.
+
+    Deleting the fixture's own fake is not enough to simulate "psmisc is not
+    installed": the real `fuser` is still further along PATH. A directory of
+    symlinks to everything except the named commands is the only way to ask
+    the scripts what they do on a host that genuinely lacks them.
+    """
+    key = tuple(sorted(names))
+    if key in _SANITISED_PATHS:
+        return _SANITISED_PATHS[key]
+    farm = tempfile.mkdtemp(prefix="qnap-path-without-")
+    seen = set(names)
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not os.path.isdir(directory):
+            continue
+        for entry in os.listdir(directory):
+            if entry in seen:
+                continue
+            seen.add(entry)
+            try:
+                os.symlink(os.path.join(directory, entry),
+                           os.path.join(farm, entry))
+            except OSError:
+                pass
+    _SANITISED_PATHS[key] = farm
+    return farm
 
 
 class ShellFixture:
@@ -250,6 +379,17 @@ class ShellFixture:
         self.proc_dir = os.path.join(self.harness, "proc")
         self.fake_bin = os.path.join(self.harness, "bin")
         self.fake_state = os.path.join(self.harness, "state")
+        # The chip, the program that talks to it and the writer-lock root all
+        # live outside the fake root: an uninstall must not be able to delete
+        # the thing being measured, and none of them belongs in a snapshot.
+        self.fan_device = os.path.join(self.harness, "sys/devices/platform",
+                                       "f71882fg.2592")
+        self.fan_device_glob = os.path.join(os.path.dirname(self.fan_device),
+                                            "f71882fg.*")
+        # Deliberately not inside fake_bin: that directory is prepended to
+        # PATH, and the program under test is invoked by path, never by name.
+        self.fan_binary = os.path.join(self.harness, "fanctl-under-test")
+        self.lock_dir = os.path.join(self.harness, "run/qnap-tsx70")
         self.port = os.path.join(self.dev_dir, "ttyS1")
         # Our executables are Python scripts, so the kernel reports the
         # interpreter as /proc/<pid>/exe. Kept outside the fake root so it is
@@ -279,6 +419,13 @@ class ShellFixture:
             self._write_exec(os.path.join(self.fake_bin, name), body)
         self.kill_path = os.path.join(self.fake_bin, "fake-kill")
         self._write_exec(self.kill_path, FAKE_KILL)
+
+        # Reaches the scripts and anything they run. with_fan_chip() adds the
+        # failure injection; the healthy chip below is the default, because
+        # the machine these scripts are written for has one.
+        self.extra_env = {}
+        self.fan_log = os.path.join(self.fake_state, "fan.log")
+        self.with_fan_controller()
 
         self.units = {}
         self.holders = {}
@@ -352,13 +499,118 @@ class ShellFixture:
                   "w", encoding="utf-8") as fh:
             fh.write(str(after))
 
+    def spawn_process_on_daemon_reload(self, pid, comm, exe=None, argv=None):
+        """Create a lingering fake process at the next `systemctl daemon-reload`."""
+        with open(os.path.join(self.fake_state, "spawn-on-reload.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"pid": pid, "comm": comm, "exe": exe,
+                       "argv": argv or [comm]}, fh)
+
     def make_start_inert(self, unit):
         """The unit starts without error but never becomes active."""
         open(os.path.join(self.fake_state, "inert", unit), "w").close()
 
-    def make_stop_ineffective(self, unit):
-        """`systemctl stop` succeeds but the unit stays active."""
-        open(os.path.join(self.fake_state, "stuck", unit), "w").close()
+    def make_stop_ineffective(self, unit, after=0):
+        """`systemctl stop` succeeds but the unit stays active.
+
+        From call `after`+1 onwards, so a test can leave the transition's own
+        stop working and break only the one a rollback makes.
+        """
+        with open(os.path.join(self.fake_state, "stuck", unit), "w",
+                  encoding="utf-8") as fh:
+            fh.write(str(after))
+
+    def make_port_tools_vanish_after_one_use(self):
+        """Return an env where fuser answers once and is then gone.
+
+        A package removed or upgraded between preflight and the moment the
+        service has to open the port is the only way to reach the installer's
+        second no-inspection guard, since preflight refuses that host
+        outright. Without a seam for it, that guard could be deleted and every
+        test would still pass.
+        """
+        self._write_exec(os.path.join(self.fake_bin, "fuser"),
+                         FAKE_FUSER_SELF_DESTRUCT)
+        return {"PATH": self.fake_bin + os.pathsep
+                        + path_without("fuser", "lsof")}
+
+    def with_fan_controller(self, channels=(3,), enable=2, rpm=900, pwm=160,
+                            ignore_writes=(), fail_writes=(),
+                            controllable=True):
+        """(Re)build the fake f71882fg device and the program that drives it.
+
+        Called once from the constructor, so every scenario starts on a
+        machine whose fan controller works and answers - which is the machine
+        these scripts are written for, and the only baseline against which
+        "it refused because the chip would not take the fans back" means
+        anything. Call it again to describe a different chip.
+
+        enable          initial pwmN_enable contents; "" is a register that
+                        reads back as nothing at all
+        ignore_writes   registers that take a write and keep their contents
+        fail_writes     registers whose write reports failure
+        controllable    False leaves the tachometer with no duty registers at
+                        all, which is a chip nothing can be handed back on
+        """
+        shutil.rmtree(self.fan_device, ignore_errors=True)
+        os.makedirs(self.fan_device, exist_ok=True)
+        for channel in channels:
+            mode = enable.get(channel, 2) if isinstance(enable, dict) else enable
+            with open(os.path.join(self.fan_device, "fan%d_input" % channel),
+                      "w", encoding="ascii") as fh:
+                fh.write("%d\n" % rpm)
+            if not controllable:
+                continue
+            with open(os.path.join(self.fan_device, "pwm%d" % channel), "w",
+                      encoding="ascii") as fh:
+                fh.write("%d\n" % pwm)
+            with open(os.path.join(self.fan_device, "pwm%d_enable" % channel),
+                      "w", encoding="ascii") as fh:
+                fh.write("%s\n" % mode)
+        self._write_exec(self.fan_binary, FAKE_FAN_BINARY)
+        open(self.fan_log, "w").close()
+        self.extra_env.update({
+            "FAKE_FAN_SOURCE": os.path.join(REPO_ROOT,
+                                            "bin/qnap-tsx70-fancontrol"),
+            "FAKE_FAN_DEVICE_GLOB": self.fan_device_glob,
+            "FAKE_FAN_LOG": self.fan_log,
+            "FAKE_FAN_IGNORE_WRITES": " ".join(ignore_writes),
+            "FAKE_FAN_FAIL_WRITES": " ".join(fail_writes),
+            "QNAP_TSX70_DEVICE_GLOB": self.fan_device_glob,
+            "QNAP_TSX70_FAN_BINARY": self.fan_binary,
+            "QNAP_TSX70_LOCK_DIR": self.lock_dir,
+        })
+        return self.fan_device
+
+    def without_fan_controller(self):
+        """A host where the driver is not loaded: the glob matches nothing.
+
+        The program cannot resolve a controller, so it cannot write to one,
+        so it cannot say where the fans are.
+        """
+        shutil.rmtree(self.fan_device, ignore_errors=True)
+
+    def with_fan_chip(self, **kwargs):
+        """As with_fan_controller, plus the program installed under the root.
+
+        scripts/uninstall.sh runs the *installed* binary, because that is the
+        one it is about to delete. scripts/install.sh runs the repository copy
+        instead, so it needs no equivalent.
+        """
+        device = self.with_fan_controller(**kwargs)
+        self._write_exec(os.path.join(self.bin_dir, "qnap-tsx70-fancontrol"),
+                         FAKE_FAN_BINARY)
+        return device
+
+    def fan_register(self, name):
+        """Current contents of one register of the fake chip."""
+        with open(os.path.join(self.fan_device, name), encoding="ascii") as fh:
+            return fh.read().strip()
+
+    def fan_commands(self):
+        """Every argv the fake fan binary was invoked with."""
+        with open(self.fan_log, encoding="utf-8") as fh:
+            return [line.strip() for line in fh if line.strip()]
 
     def add_process(self, pid, comm, exe=None, argv=None, linger=False):
         """Create a fake /proc entry. exe is a symlink, as the kernel makes it."""
@@ -399,6 +651,7 @@ class ShellFixture:
             "FAKE_UNIT_DIR": self.unit_dir,
             "FAKE_PROC_DIR": self.proc_dir,
         })
+        environment.update(self.extra_env)
         environment.update(extra)
         return environment
 

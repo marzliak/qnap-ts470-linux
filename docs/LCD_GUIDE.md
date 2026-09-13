@@ -332,22 +332,28 @@ control.
 5. **Enable and start.** Enables the service at boot and starts it.
 6. **Validate.** Confirms the service is active and runs `--check` again.
 
-If step 4, 5 or 6 fails during a migration, the installer restores the previous
-installation automatically.
+Every path the installer can touch is recorded before the first change. If any
+step from the first stop onwards fails — including legacy cleanup — the whole
+thing is rolled back to exactly that recorded state, on a reinstall as well as
+on a migration. See
+[MIGRATION_FROM_SATURN.md](MIGRATION_FROM_SATURN.md#4-rolling-back).
 
 ### Options
 
 | Option | Effect |
 |---|---|
 | `--lcd` | LCD only. The default; the flag is there for clarity in scripts. |
-| `--with-fan-control` | Also install the experimental fan service. Read [FAN_CONTROL.md](FAN_CONTROL.md) first. |
+| `--with-fan-control` | Also install the experimental fan service. Read [FAN_CONTROL.md](FAN_CONTROL.md) first. Without it the fan binary is not written, so an already-running fan service is left running rather than stopped. |
 | `--dry-run` | Print every action, change nothing. |
-| `--no-migrate` | Leave any pre-2.0.0 installation alone. |
+| `--no-migrate` | Leave any pre-2.0.0 installation alone — its files and its running services. If the legacy display daemon holds the serial port, the install stops during preflight rather than stopping a service it promised not to touch. |
 | `--skip-deps` | Do not install distribution packages. |
-| `--force` | Continue even if the serial preflight fails. |
+| `--force` | Continue when the serial port or the fan controller is **absent**. It does not cover a serial port held by a process the installer does not recognise, nor a host where ownership cannot be determined at all — install `psmisc` or `lsof` for that. |
+| `--allow-serial-owner PID` | Accept PID as the port's current holder even though it is not one of this project's services. The installer never signals that process, and still refuses to continue unless the port is free by the time the service needs it. It needs `fuser` or `lsof` like every other check here: on a host with neither, ownership cannot be read at all and the install stops instead of accepting your word for something nothing can verify. |
 
-Running the installer again is safe. It overwrites the binary and unit, keeps
-your config, and restarts the service.
+Running the installer again is safe. It stops the running service, overwrites
+the binary and unit, keeps your config, and starts it again. Everything it
+replaces is recorded first, so an interrupted reinstall is rolled back to the
+state it found.
 
 ---
 

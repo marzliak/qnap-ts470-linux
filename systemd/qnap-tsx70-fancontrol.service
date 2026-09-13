@@ -25,6 +25,13 @@ Type=simple
 ExecStart=/usr/local/bin/qnap-tsx70-fancontrol run
 # Closes the SIGKILL / OOM-kill hole: if the process dies without running its
 # own handlers, this still hands the fans back to the chip's automatic mode.
+#
+# The leading '-' is deliberate. safe-state exits nonzero when it cannot prove
+# the chip took the fans back, and 'run' already reports that condition through
+# its own exit status, which systemd acts on. This is the last-resort retry
+# after the main process is gone: its verdict belongs in the journal, where it
+# is logged per channel, and not in a failed unit that would also be raised by
+# a shutdown that unloaded f71882fg before stopping this service.
 ExecStopPost=-/usr/local/bin/qnap-tsx70-fancontrol safe-state
 Restart=always
 RestartSec=15
@@ -48,7 +55,16 @@ RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=yes
 SystemCallArchitectures=native
-ReadWritePaths=/var/lib/qnap-tsx70
+# The calibration cache, and the writer-lock root. The lock is named after the
+# physical controller and lives here rather than beside the cache, so that an
+# operator calibrating with a custom --cache still contends with this service.
+#
+# Deliberately not RuntimeDirectory=qnap-tsx70: systemd removes a runtime
+# directory when the unit stops, which would unlink a lock file an interactive
+# `calibrate` is holding. The next writer would then create a fresh file at the
+# same path, flock it successfully, and drive the same registers. The program
+# creates the directory itself instead, and never removes it.
+ReadWritePaths=/var/lib/qnap-tsx70 /run/qnap-tsx70
 
 [Install]
 WantedBy=multi-user.target

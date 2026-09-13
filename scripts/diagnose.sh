@@ -31,6 +31,7 @@ Usage: sudo ./scripts/diagnose.sh [options]
 
 Options:
   -o, --output FILE   Write the bundle to FILE instead of stdout.
+                      --output=FILE is accepted too.
       --with-smart    Include per-disk SMART summaries (serials removed).
   -h, --help          Show this help.
 
@@ -127,7 +128,8 @@ collect() {
     # inline comments and duplicate keys instead of re-parsing the file here.
     local port lcd
     port=""
-    for lcd in /usr/local/bin/qnap-tsx70-lcd "$REPO_ROOT/bin/qnap-tsx70-lcd"; do
+    for lcd in ${QNAP_TSX70_LCD_BIN:+"$QNAP_TSX70_LCD_BIN"} \
+               /usr/local/bin/qnap-tsx70-lcd "$REPO_ROOT/bin/qnap-tsx70-lcd"; do
         [ -f "$lcd" ] || continue
         port="$(python3 "$lcd" --config "$CONF_FILE" --print-config serial_port \
                 2>/dev/null)" && [ -n "$port" ] && break

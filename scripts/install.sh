@@ -35,6 +35,8 @@ REPO_ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." &&
 #   QNAP_TSX70_KILL         command used to signal a validated legacy process
 #   QNAP_TSX70_SETTLE_SECS  pause before post-install validation
 #   QNAP_TSX70_STOP_TIMEOUT bound on every "wait until it is really gone" loop
+#   QNAP_TSX70_DEVICE_GLOB  platform-device pattern for the fan controller
+#   QNAP_TSX70_FAN_BINARY   fan-control program used to verify the handback
 #
 # systemctl, fuser, modprobe and python3 are resolved from PATH, so a test
 # supplies fakes by putting them earlier in PATH.
@@ -44,6 +46,12 @@ PROC_DIR="${QNAP_TSX70_PROC_DIR:-/proc}"
 KILL_CMD="${QNAP_TSX70_KILL:-kill}"
 SETTLE_SECS="${QNAP_TSX70_SETTLE_SECS:-2}"
 STOP_TIMEOUT="${QNAP_TSX70_STOP_TIMEOUT:-20}"
+FAN_DEVICE_GLOB="${QNAP_TSX70_DEVICE_GLOB:-/sys/devices/platform/f71882fg.*}"
+# The repository copy, not an installed one: the handback verdict has to come
+# from the version being shipped, because an older installed binary is exactly
+# the thing whose behaviour is not trusted here. It is the same rule
+# cache_is_valid already follows for the calibration schema.
+FAN_BINARY="${QNAP_TSX70_FAN_BINARY:-$REPO_ROOT/bin/qnap-tsx70-fancontrol}"
 
 BIN_DIR="$TEST_ROOT/usr/local/bin"
 UNIT_DIR="$TEST_ROOT/etc/systemd/system"
@@ -67,10 +75,20 @@ LEGACY_BINS=("${LEGACY_LCD_BINS[@]}" "${LEGACY_FAN_BINS[@]}")
 LEGACY_CACHE="$TEST_ROOT/etc/saturn-fan-cache.json"
 LEGACY_PID="$TEST_ROOT/run/saturn-fancontrol.pid"
 
+# Every fan unit and executable a rollback can put back or take away, whatever
+# this run's install-time scope was. The scope says what the install meant to
+# change; a rollback undoes the whole transaction, and txn_snapshot_all
+# records all of these, so the quiescence gate in front of it covers the same
+# set rather than the narrower one.
+ROLLBACK_FAN_UNITS=("$NEW_FAN_UNIT" "${LEGACY_FAN_UNITS[@]}")
+ROLLBACK_FAN_BINS=(qnap-tsx70-fancontrol "${LEGACY_FAN_BINS[@]}")
+
 # Executables that may legitimately hold the panel's serial port.
 LCD_OWNER_BINS=(qnap-tsx70-lcd "${LEGACY_LCD_BINS[@]}")
-# Executables that may legitimately be driving the fans.
-FAN_OWNER_BINS=(qnap-tsx70-fancontrol "${LEGACY_FAN_BINS[@]}")
+# There is deliberately no equivalent all-fan-executables list. Which fan
+# binaries matter depends on what a given run replaces or removes, and a gate
+# over every name this script knows is what stopped an LCD-only install
+# because of a fan service it was never going to touch. plan_scope decides.
 # An interpreter is only ever accepted together with a script path in argv.
 # Matched as a pattern: a script started through `#!/usr/bin/env python3` has
 # comm=python3 but /proc/<pid>/exe resolving to /usr/bin/python3.14, and an
@@ -93,7 +111,31 @@ TXN_DIRS=()
 ROLLBACK_NEEDED=0
 ROLLBACK_RUNNING=0
 CACHE_MIGRATED=0
-CACHE_PRESERVED=0
+CACHE_PRESERVED_INVALID=0
+CACHE_SUPERSEDED=0
+
+# What this run is actually going to replace or remove. Nothing else may be
+# stopped. An LCD-only install does not touch the fan binary or its unit, so
+# stopping an fan service that was running is a change to the machine the
+# operator did not ask for; --no-migrate promises the legacy tree is left
+# alone, which includes leaving its services running. Filled in by plan_scope
+# once the legacy decision is known, and read by every stop and every
+# quiescence gate.
+LEGACY_IN_SCOPE=0
+# Set once `qnap-tsx70-fancontrol safe-state` has exited 0 in this run. Nothing
+# else may set it, and no fan recovery artifact is deleted or replaced without
+# it.
+FAN_HANDBACK_VERIFIED=0
+FAN_SCOPE_UNITS=()
+FAN_SCOPE_BINS=()
+LCD_SCOPE_UNITS=()
+FAN_UNIT_WAS_ACTIVE=0
+# The rollback's own fan verdict, which is a different question from
+# FAN_HANDBACK_VERIFIED above and is never derived from it: 0 no fan artifact
+# is at risk in this rollback, 1 a fresh quiescence and handback proved the
+# fans are back, 2 it could not be proved and no fan artifact may be touched.
+ROLLBACK_FAN_GATE=0
+ROLLBACK_SKIPPED_FAN=()
 
 RED=""; YELLOW=""; GREEN=""; BOLD=""; RESET=""
 if [ -t 1 ]; then
@@ -121,13 +163,16 @@ Options:
   --skip-deps           Do not install distribution packages.
   --force               Continue when the serial port or the fan controller
                         is absent. It does NOT allow installing while an
-                        unrecognised process holds the serial port.
+                        unrecognised process holds the serial port, nor when
+                        who holds it cannot be determined at all.
   --allow-serial-owner PID
                         Accept PID as the current holder of the serial port
                         even though it is not one of this project's services.
-                        The installer still never signals it, and still
-                        refuses to continue unless the port is actually free
-                        by the time the service has to open it.
+                        The installer still never signals it, and still refuses
+                        to continue unless the port is actually free by the
+                        time the service has to open it. It needs fuser or
+                        lsof like everything else here: without one, ownership
+                        cannot be checked and the install stops instead.
   --dry-run             Print the actions without changing anything.
   -h, --help            Show this help.
 
@@ -296,17 +341,92 @@ pid_is_definitely() {
     return 1
 }
 
-# Subcommands that only read. A `qnap-tsx70-fancontrol status` in another
-# terminal, or this installer's own validate-cache child, is not a writer, and
-# treating it as one would stall every run for STOP_TIMEOUT and then abort.
-READ_ONLY_SUBCOMMANDS=(status validate-cache --version --help)
+# ---------------------------------------------------------------------------
+# Fan-control command grammar
+#
+# `qnap-tsx70-fancontrol status` in another terminal, and this installer's own
+# validate-cache child, are not fan writers; treating them as ones would stall
+# every run for STOP_TIMEOUT and then abort.
+#
+# What must never happen is the reverse. The first version of this test asked
+# whether *any* argv token equalled one of the read-only words, so
+# `qnap-tsx70-fancontrol run --sensor status` - a live control loop - was
+# classified read-only and the installer deleted the binary out from under it.
+# So the command is parsed structurally instead: find the executable in argv,
+# then walk forward past options and their values to the command word. The
+# grammar below is bin/qnap-tsx70-fancontrol's own (see build_parser there):
+# the command is a positional that argparse requires before any of the
+# per-command options, so nothing after it can change what it is.
+# ---------------------------------------------------------------------------
+FAN_READ_ONLY_COMMANDS=(status validate-cache --version --help -h)
+FAN_WRITER_COMMANDS=(run calibrate safe-state)
+# Options that consume the token after them, so a value can never be mistaken
+# for the command word.
+FAN_VALUE_OPTIONS=(--device-glob --cache --sensor --interval --temp-min
+                   --temp-max --channels)
 
-pid_is_read_only() {
-    local token
+# fan_command_of <pid> <name>... - print the fan-control command word a
+# process is running. Nonzero when argv contains none of <name>..., or when no
+# command word can be identified; every caller treats that as a writer.
+fan_command_of() {
+    local pid="$1"; shift
+    local names=("$@")
+    local token state=before skip=0
     while IFS= read -r token; do
-        in_list "$token" "${READ_ONLY_SUBCOMMANDS[@]}" && return 0
-    done < <(pid_argv "$1" || true)
+        if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+        case "$state" in
+            # Everything up to and including the executable belongs to an
+            # interpreter: `/usr/bin/python3 -u /usr/local/bin/... run`.
+            before)
+                if in_list "${token##*/}" "${names[@]}"; then state=after; fi
+                continue ;;
+            # After a `--` separator the next token is the command, whatever
+            # it looks like.
+            positional) printf '%s' "$token"; return 0 ;;
+        esac
+        case "$token" in
+            "") continue ;;
+            -h|--help|--version) printf '%s' "$token"; return 0 ;;
+            --) state=positional; continue ;;
+            --*=*) continue ;;
+            -*)
+                if in_list "$token" "${FAN_VALUE_OPTIONS[@]}"; then skip=1; fi
+                continue ;;
+            *) printf '%s' "$token"; return 0 ;;
+        esac
+    done < <(pid_argv "$pid" || true)
     return 1
+}
+
+# fan_pid_class <pid> <name>... - "read-only", "writer" or "unknown".
+#
+# "unknown" is the fail-closed answer and covers a command this version does
+# not know, an invocation with no command word at all, and a process whose
+# argv does not contain one of <name>... (a legacy saturn-* daemon with its
+# own grammar, or a name that only matched comm). Every caller treats it like
+# a writer, because the cost is not symmetric: a false writer is a refusal the
+# operator can act on, a false reader deletes the binary out from under a
+# process driving PWM registers.
+fan_pid_class() {
+    local pid="$1"; shift
+    local verb
+    if ! verb="$(fan_command_of "$pid" "$@")"; then
+        printf 'unknown'
+        return 0
+    fi
+    if in_list "$verb" "${FAN_READ_ONLY_COMMANDS[@]}"; then
+        printf 'read-only'
+    elif in_list "$verb" "${FAN_WRITER_COMMANDS[@]}"; then
+        printf 'writer'
+    else
+        printf 'unknown'
+    fi
+}
+
+# pid_is_read_only <pid> <name>... - true only for an invocation that is
+# structurally one of the read-only commands.
+pid_is_read_only() {
+    [ "$(fan_pid_class "$@")" = "read-only" ]
 }
 
 # pid_may_be <pid> <name>... - liberal identity.
@@ -338,7 +458,7 @@ known_processes() {
     for entry in "$PROC_DIR"/[0-9]*; do
         [ -d "$entry" ] || continue
         pid="${entry##*/}"
-        if pid_may_be "$pid" "$@" && ! pid_is_read_only "$pid"; then
+        if pid_may_be "$pid" "$@" && ! pid_is_read_only "$pid" "$@"; then
             printf '%s\n' "$pid"
         fi
     done
@@ -405,9 +525,15 @@ SERIAL_PORT=""
 SERIAL_OWNER_KIND="free"
 SERIAL_OWNER_PIDS=""
 SERIAL_OWNER_OVERRIDDEN=0
+SERIAL_OWNER_OUT_OF_SCOPE=""
 
 classify_serial_owner() {
     local port="$1" pids pid unit
+    if ! can_inspect_port; then
+        SERIAL_OWNER_KIND="unknowable"
+        SERIAL_OWNER_PIDS=""
+        return 0
+    fi
     pids="$(port_holders "$port")"
     SERIAL_OWNER_PIDS="$(printf '%s' "$pids" | tr '\n' ' ' | sed 's/ *$//')"
     if [ -z "$pids" ]; then
@@ -421,6 +547,7 @@ classify_serial_owner() {
             continue
         fi
         if pid_is_definitely "$pid" "${LCD_OWNER_BINS[@]}"; then
+            note_out_of_scope_owner "$pid"
             continue
         fi
         # systemd knows which process belongs to which unit even when the
@@ -429,7 +556,10 @@ classify_serial_owner() {
         for unit in "$NEW_LCD_UNIT" "${LEGACY_LCD_UNITS[@]}"; do
             [ "$(unit_main_pid "$unit")" = "$pid" ] && { matched=1; break; }
         done
-        [ "$matched" -eq 1 ] && continue
+        if [ "$matched" -eq 1 ]; then
+            note_out_of_scope_owner "$pid"
+            continue
+        fi
         all_known=0
         warn "$port is held by an unrecognised process: $(pid_describe "$pid")"
     done
@@ -438,6 +568,33 @@ classify_serial_owner() {
     else
         SERIAL_OWNER_KIND="unknown"
     fi
+}
+
+# note_out_of_scope_owner <pid> - one of this project's own LCD processes holds
+# the port, but this run is not going to stop it.
+#
+# "Recognised" used to be the end of the question, and preflight then promised
+# the holder "will be stopped as part of the planned transition". With
+# --no-migrate that promise is false: the legacy LCD is deliberately left
+# alone, so the port never comes free and the new service fails to open it
+# after the install has already replaced everything. Better to say so before
+# the first mutation.
+note_out_of_scope_owner() {
+    local pid="$1" unit
+    if [ "$LEGACY_IN_SCOPE" -eq 1 ]; then
+        return 0
+    fi
+    if pid_is_definitely "$pid" "${LEGACY_LCD_BINS[@]}"; then
+        SERIAL_OWNER_OUT_OF_SCOPE="${SERIAL_OWNER_OUT_OF_SCOPE}$pid "
+        return 0
+    fi
+    for unit in "${LEGACY_LCD_UNITS[@]}"; do
+        if [ "$(unit_main_pid "$unit")" = "$pid" ]; then
+            SERIAL_OWNER_OUT_OF_SCOPE="${SERIAL_OWNER_OUT_OF_SCOPE}$pid "
+            return 0
+        fi
+    done
+    return 0
 }
 
 preflight() {
@@ -490,18 +647,37 @@ preflight() {
     fi
     if port_present "$SERIAL_PORT"; then
         ok "serial port $SERIAL_PORT present"
-        if ! can_inspect_port; then
-            warn "neither fuser nor lsof is installed, so who holds"
-            warn "$SERIAL_PORT cannot be determined. Install psmisc, or re-run"
-            warn "with --force if you have checked the port yourself."
-            [ "$FORCE" -eq 1 ] || failed=1
-        fi
         classify_serial_owner "$SERIAL_PORT"
         case "$SERIAL_OWNER_KIND" in
             free) ok "serial port is free" ;;
+            unknowable)
+                # Fail closed, with no way past it. --allow-serial-owner used
+                # to double as the escape hatch here, which was dishonest: with
+                # no fuser and no lsof there is nothing to check the named PID
+                # against, no way to tell whether it even holds the port, and
+                # no way to confirm the port is free before the new service
+                # opens it. The only truthful answer is to ask for a tool.
+                warn "neither fuser nor lsof is installed, so who holds"
+                warn "$SERIAL_PORT cannot be determined - and an unverifiable"
+                warn "port is not a free one. Install one of them first:"
+                warn "  apt-get install psmisc     # provides fuser"
+                warn "  apt-get install lsof"
+                warn "Neither --force nor --allow-serial-owner covers this:"
+                warn "there is nothing here for either of them to be right about."
+                failed=1
+                ;;
             known)
                 if [ "$SERIAL_OWNER_OVERRIDDEN" -eq 1 ]; then
                     ok "serial port owner accepted (pids: $SERIAL_OWNER_PIDS)"
+                elif [ -n "$SERIAL_OWNER_OUT_OF_SCOPE" ]; then
+                    warn "$SERIAL_PORT is held by a legacy LCD process (pids:"
+                    warn "${SERIAL_OWNER_OUT_OF_SCOPE% })"
+                    warn "and --no-migrate means this run leaves the legacy"
+                    warn "installation, that process included, exactly as it is."
+                    warn "The new LCD service could not then open the port."
+                    warn "Stop it yourself, or drop --no-migrate and let the"
+                    warn "migration stop it after the backup exists."
+                    failed=1
                 else
                     ok "serial port held by this project's own service (pids: $SERIAL_OWNER_PIDS)"
                     info "       it will be stopped as part of the planned transition"
@@ -514,7 +690,7 @@ preflight() {
                 failed=1
                 ;;
         esac
-        if [ -n "$ALLOW_SERIAL_OWNER" ]; then
+        if [ -n "$ALLOW_SERIAL_OWNER" ] && [ "$SERIAL_OWNER_OVERRIDDEN" -eq 1 ]; then
             warn "accepting pid $ALLOW_SERIAL_OWNER as the serial port owner on your word;"
             warn "it will not be signalled, and the port must be free before the service starts"
         fi
@@ -525,7 +701,7 @@ preflight() {
 
     if [ "$WITH_FAN" -eq 1 ]; then
         local matches
-        matches="$(compgen -G '/sys/devices/platform/f71882fg.*' | wc -l || true)"
+        matches="$(compgen -G "$FAN_DEVICE_GLOB" | wc -l || true)"
         if [ "${matches:-0}" -eq 1 ]; then
             ok "fan controller found"
         elif [ "${matches:-0}" -eq 0 ]; then
@@ -679,7 +855,11 @@ make_backup() {
         if [ -f "$UNIT_DIR/$unit" ]; then
             run cp -a "$UNIT_DIR/$unit" "$BACKUP_DIR/systemd/"
             if unit_is_enabled "$unit"; then
-                run sh -c "printf '%s\n' '$unit' >> '$BACKUP_DIR/enabled-units'"
+                if [ "$DRY_RUN" -eq 1 ]; then
+                    printf '       [dry-run] record %s as enabled\n' "$unit"
+                else
+                    printf '%s\n' "$unit" >> "$BACKUP_DIR/enabled-units"
+                fi
             fi
         fi
     done
@@ -747,34 +927,151 @@ wait_for_no_process() {
 
 fan_recovery_hint() {
     warn "nothing has been removed. Recover manually:"
-    warn "  systemctl status ${LEGACY_FAN_UNITS[*]} $NEW_FAN_UNIT"
-    warn "  systemctl stop   ${LEGACY_FAN_UNITS[*]} $NEW_FAN_UNIT"
+    warn "  systemctl status ${FAN_SCOPE_UNITS[*]}"
+    warn "  systemctl stop   ${FAN_SCOPE_UNITS[*]}"
     warn "  qnap-tsx70-fancontrol safe-state    # hands the fans back to the chip"
     warn "then re-run this installer."
 }
 
-# stop_fan_services - every fan writer, old and new, off and proven off.
-# Units first, then the bare legacy daemon named by its PID file, and only
-# then the quiescence gate: the PID-file process is a fan writer nothing else
-# supervises, so checking for it before asking it to stop would always abort.
+# stop_fan_services - every fan writer this run is about to replace or delete,
+# off and proven off. Units first, then the bare legacy daemon named by its PID
+# file, and only then the quiescence gate: the PID-file process is a fan writer
+# nothing else supervises, so checking for it before asking it to stop would
+# always abort.
+#
+# Nothing happens here when the scope is empty, which is the LCD-only,
+# no-migration case: this run writes no fan binary and deletes none, so a fan
+# service that is running is not its business and is left running.
 stop_fan_services() {
     local unit
-    for unit in "${LEGACY_FAN_UNITS[@]}" "$NEW_FAN_UNIT"; do
+    if [ "${#FAN_SCOPE_UNITS[@]}" -eq 0 ]; then
+        ok "no fan artifact is being replaced or removed; fan services left as they are"
+        return 0
+    fi
+    for unit in "${FAN_SCOPE_UNITS[@]}"; do
         unit_exists "$unit" || unit_is_active "$unit" || continue
+        if [ "$unit" = "$NEW_FAN_UNIT" ] && unit_is_active "$unit"; then
+            # Remembered so a successful install puts it back the way it was
+            # found instead of silently leaving fan control down.
+            FAN_UNIT_WAS_ACTIVE=1
+        fi
         if ! stop_unit_verified "$unit"; then
             fan_recovery_hint
             return 1
         fi
     done
-    if ! stop_legacy_pid_process; then
+    if [ "$LEGACY_IN_SCOPE" -eq 1 ] && ! stop_legacy_pid_process; then
         fan_recovery_hint
         return 1
     fi
-    if ! wait_for_no_process "fan control" "${FAN_OWNER_BINS[@]}"; then
+    if ! wait_for_no_process "fan control" "${FAN_SCOPE_BINS[@]}"; then
         fan_recovery_hint
         return 1
     fi
     return 0
+}
+
+# legacy_fan_artifacts_present - is there a legacy fan binary or unit on this
+# machine that a migration would delete? The cache is not one: it is data, it
+# drives nothing, and it has its own provenance rules.
+legacy_fan_artifacts_present() {
+    local unit bin
+    for unit in "${LEGACY_FAN_UNITS[@]}"; do
+        [ -f "$UNIT_DIR/$unit" ] && return 0
+    done
+    for bin in "${LEGACY_FAN_BINS[@]}"; do
+        [ -f "$BIN_DIR/$bin" ] && return 0
+    done
+    return 1
+}
+
+# fan_artifacts_at_risk - does this run delete or replace a file that is
+# somebody's way back from a fan stuck in manual mode?
+#
+# Only the binary and the unit count. A fresh --with-fan-control install on a
+# machine that has neither is adding a recovery mechanism, not removing one,
+# so it is not at risk and does not have to prove anything about a controller
+# whose driver this run has not even loaded yet.
+fan_artifacts_at_risk() {
+    if [ "$LEGACY_IN_SCOPE" -eq 1 ] && legacy_fan_artifacts_present; then
+        return 0
+    fi
+    if [ "$WITH_FAN" -eq 1 ]; then
+        [ -f "$BIN_DIR/qnap-tsx70-fancontrol" ] && return 0
+        [ -f "$UNIT_DIR/$NEW_FAN_UNIT" ] && return 0
+    fi
+    return 1
+}
+
+# verify_fan_handback - prove the chip has the fans before this run deletes or
+# replaces the executable that is how anyone would prove it afterwards.
+#
+# An inactive unit and an empty process table are both equally true of a
+# machine whose fan is parked at a calibration stall duty with pwmN_enable
+# still reading 1. Neither says anything about the PWM registers. The only
+# evidence is a write followed by a readback, which is what `safe-state` does
+# and what its exit status - and nothing else about it, not its output and not
+# the fact that it ran - reports.
+#
+# Scope is half the point: a run that is not removing or replacing a fan
+# recovery artifact has no business writing to a fan controller at all, so an
+# LCD-only install never reaches the command.
+#
+# This cannot be delegated to the unit's ExecStopPost=. That line carries a
+# `-` prefix, which tells systemd to ignore its exit status, so it is a
+# best-effort cleanup and never a verdict.
+verify_fan_handback() {
+    if ! fan_artifacts_at_risk; then
+        ok "no fan binary or unit is being replaced or removed; the fan controller is left alone"
+        return 0
+    fi
+    step "Confirming the fans are back under the controller"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '       [dry-run] python3 %s safe-state\n' "$FAN_BINARY"
+        printf '       [dry-run] replacing or deleting a fan binary or unit is gated on its exit status\n'
+        return 0
+    fi
+    if [ ! -f "$FAN_BINARY" ]; then
+        warn "no fan-control program at $FAN_BINARY, so the handback cannot be"
+        warn "verified. The fan binary and unit already on this machine are the"
+        warn "only way back from a fan left in manual mode, so they stay."
+        fan_handback_hint
+        return 1
+    fi
+    if fan_handback_now; then
+        FAN_HANDBACK_VERIFIED=1
+        return 0
+    fi
+    warn "the fans could not be confirmed back in the controller's automatic"
+    warn "mode, so nothing that could put them there is being removed or"
+    warn "replaced. Every fan binary and unit on this machine stays where it is."
+    fan_handback_hint
+    return 1
+}
+
+# fan_handback_now - ask the chip and read the answer back. No scope decision
+# and no state of its own: the caller has already decided that it has to prove
+# this, and the exit status of `safe-state` is the whole verdict. Its output
+# is reported because an operator needs it, and decides nothing.
+fan_handback_now() {
+    if [ ! -f "$FAN_BINARY" ]; then
+        warn "there is no fan-control program at $FAN_BINARY to ask"
+        return 1
+    fi
+    local out
+    if out="$(python3 "$FAN_BINARY" safe-state --device-glob "$FAN_DEVICE_GLOB" 2>&1)"; then
+        ok "automatic fan mode verified on the controller"
+        return 0
+    fi
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/       /' >&2
+    return 1
+}
+
+fan_handback_hint() {
+    warn "Recover, then re-run this installer:"
+    warn "  modprobe f71882fg                                  # if the driver is not loaded"
+    warn "  python3 $FAN_BINARY status"
+    warn "  python3 $FAN_BINARY safe-state     # must exit 0"
 }
 
 # stop_legacy_pid_process - the PID file names a process that may still be
@@ -864,13 +1161,40 @@ detect_legacy() {
     [ "$found" -eq 1 ]
 }
 
+# plan_scope <legacy> - decide what this run owns.
+#
+# A service is only stopped when this run replaces or deletes the binary or
+# unit behind it, because that is the only thing a stop is protecting against.
+# The new fan unit is in scope only with --with-fan-control, since without it
+# install_files never writes bin/qnap-tsx70-fancontrol. The legacy tree is in
+# scope only when a migration is actually going to remove it.
+plan_scope() {
+    local legacy="$1"
+    LEGACY_IN_SCOPE="$legacy"
+    FAN_SCOPE_UNITS=()
+    FAN_SCOPE_BINS=()
+    LCD_SCOPE_UNITS=()
+    if [ "$legacy" -eq 1 ]; then
+        FAN_SCOPE_UNITS+=("${LEGACY_FAN_UNITS[@]}")
+        FAN_SCOPE_BINS+=("${LEGACY_FAN_BINS[@]}")
+        LCD_SCOPE_UNITS+=("${LEGACY_LCD_UNITS[@]}")
+    fi
+    if [ "$WITH_FAN" -eq 1 ]; then
+        FAN_SCOPE_UNITS+=("$NEW_FAN_UNIT")
+        FAN_SCOPE_BINS+=(qnap-tsx70-fancontrol)
+    fi
+    # The new LCD unit is always replaced, so it is always in scope.
+    LCD_SCOPE_UNITS+=("$NEW_LCD_UNIT")
+}
+
 # stop_current_services - the planned transition. Fan writers first, then the
-# LCD, so the serial port is free before anything reopens it.
+# LCD, so the serial port is free before anything reopens it. Both lists are
+# the scope, not everything this installer knows how to name.
 stop_current_services() {
     step "Stopping services for the transition"
     stop_fan_services || return 1
     local unit
-    for unit in "${LEGACY_LCD_UNITS[@]}" "$NEW_LCD_UNIT"; do
+    for unit in "${LCD_SCOPE_UNITS[@]}"; do
         unit_exists "$unit" || unit_is_active "$unit" || continue
         if ! stop_unit_verified "$unit"; then
             warn "nothing has been removed; start it again or stop it by hand,"
@@ -890,10 +1214,12 @@ verify_port_released() {
         return 0
     fi
     if ! can_inspect_port; then
+        # Preflight refuses this case outright, so reaching it means fuser or
+        # lsof disappeared mid-run. There is still no honest way to claim the
+        # port is free, and --allow-serial-owner cannot make one.
         warn "cannot confirm $SERIAL_PORT is free without fuser or lsof"
-        [ "$FORCE" -eq 1 ] || return 1
-        warn "continuing because --force was given"
-        return 0
+        warn "the LCD service is not started on an unverified port"
+        return 1
     fi
     local waited=0 holders
     while true; do
@@ -919,16 +1245,16 @@ migrate_cache() {
         return 0
     fi
     if cache_is_valid "$CACHE_FILE"; then
-        CACHE_PRESERVED=1
+        CACHE_SUPERSEDED=1
         ok "kept the existing calibration at $CACHE_FILE"
-        warn "the legacy cache was not migrated over it, so it is left at"
-        warn "$LEGACY_CACHE as well"
+        info "       the legacy cache was not migrated over it, so it is left"
+        info "       at $LEGACY_CACHE as well"
     elif cache_is_valid "$LEGACY_CACHE"; then
         install -m 0644 "$LEGACY_CACHE" "$CACHE_FILE"
         CACHE_MIGRATED=1
         ok "migrated calibration cache to $CACHE_FILE"
     else
-        CACHE_PRESERVED=1
+        CACHE_PRESERVED_INVALID=1
         warn "legacy cache $LEGACY_CACHE did not validate - not migrated"
         warn "it is left exactly where it is, and a copy is in $BACKUP_DIR/state/"
     fi
@@ -950,32 +1276,55 @@ remove_legacy() {
     step "Removing legacy saturn-* artifacts"
     # Re-checked here and not only before the install: this is the point where
     # the binary a fan writer is running gets deleted.
-    if ! wait_for_no_process "fan control" "${FAN_OWNER_BINS[@]}"; then
+    if ! wait_for_no_process "fan control" "${FAN_SCOPE_BINS[@]}"; then
         fan_recovery_hint
+        return 1
+    fi
+    # Restating the gate over the deletions themselves. No current ordering
+    # can reach this - a legacy fan artifact present now was present when
+    # verify_fan_handback ran, and that run either verified or aborted - so
+    # this is not where the protection lives. It is here so that moving the
+    # gate, or adding a path that skips it, fails closed instead of quietly
+    # deleting the one executable that can put the fans back. The dry-run
+    # exemption is not a loophole: a dry run deletes nothing.
+    if [ "$DRY_RUN" -eq 0 ] && legacy_fan_artifacts_present \
+       && [ "$FAN_HANDBACK_VERIFIED" -ne 1 ]; then
+        warn "refusing to delete the legacy fan artifacts: this run never"
+        warn "confirmed the fans were back in the controller's automatic mode"
+        fan_handback_hint
         return 1
     fi
     local unit bin
     for unit in "${LEGACY_UNITS[@]}"; do
-        if unit_exists "$unit"; then
-            run_quiet systemctl disable "$unit"
+        unit_exists "$unit" || continue
+        run_quiet systemctl disable "$unit"
+        if [ -f "$UNIT_DIR/$unit" ]; then
             run rm -f "$UNIT_DIR/$unit"
-            ok "removed $unit"
+            [ "$DRY_RUN" -eq 0 ] && ok "removed $unit"
+        else
+            # Known to systemd but not ours to delete: it is shipped
+            # somewhere like /lib/systemd/system. Disabling is all we can
+            # honestly claim.
+            ok "disabled $unit (its unit file is not in $UNIT_DIR)"
         fi
     done
     for bin in "${LEGACY_BINS[@]}"; do
         if [ -f "$BIN_DIR/$bin" ]; then
             run rm -f "$BIN_DIR/$bin"
-            ok "removed $BIN_DIR/$bin"
+            [ "$DRY_RUN" -eq 0 ] && ok "removed $BIN_DIR/$bin"
         fi
     done
     if [ -f "$LEGACY_CACHE" ]; then
         if [ "$CACHE_MIGRATED" -eq 1 ] && cache_is_valid "$CACHE_FILE"; then
             run rm -f "$LEGACY_CACHE"
             ok "removed $LEGACY_CACHE (migrated and validated)"
+        elif [ "$CACHE_SUPERSEDED" -eq 1 ]; then
+            info "       kept $LEGACY_CACHE: a newer calibration is already in"
+            info "       place, so it was not migrated over it"
         else
-            CACHE_PRESERVED=1
-            warn "kept $LEGACY_CACHE: it was not migrated, so it is the only"
-            warn "copy of that calibration outside the backup"
+            CACHE_PRESERVED_INVALID=1
+            warn "kept $LEGACY_CACHE: it did not validate, so it was not"
+            warn "migrated and it is the only copy outside the backup"
         fi
     fi
     # The PID file goes only once the process it names is provably gone.
@@ -991,7 +1340,7 @@ remove_legacy() {
         fi
     fi
     run systemctl daemon-reload
-    if [ "$CACHE_PRESERVED" -eq 1 ]; then
+    if [ "$CACHE_PRESERVED_INVALID" -eq 1 ] || [ "$CACHE_SUPERSEDED" -eq 1 ]; then
         info "       legacy artifacts removed except the calibration cache noted above"
     fi
     return 0
@@ -999,13 +1348,111 @@ remove_legacy() {
 
 # ---------------------------------------------------------------------------
 # Rollback
+#
+# A rollback runs after enable_services(), which is where restore_fan_activity()
+# starts a fan service that was running before the install back up. By the time
+# the restore below replaces the fan binary and the unit file, that service is
+# a live writer again - and FAN_HANDBACK_VERIFIED, earned before any of it,
+# describes a machine that no longer exists. Putting a file back is the same
+# act as deleting it as far as a fan parked in manual mode is concerned: it
+# takes away the executable an operator would recover with, for as long as it
+# takes, and hands the unit a different binary. So the rollback proves it
+# again, from scratch, or it leaves every fan recovery artifact exactly where
+# this install left it and says so.
 # ---------------------------------------------------------------------------
+
+# is_fan_artifact_path <path> - is this file somebody's way back from a fan
+# stuck in manual mode? The cache is not one: it is data and drives nothing.
+is_fan_artifact_path() {
+    local path="$1" name
+    [ "$path" = "$BIN_DIR/qnap-tsx70-fancontrol" ] && return 0
+    [ "$path" = "$UNIT_DIR/$NEW_FAN_UNIT" ] && return 0
+    for name in "${LEGACY_FAN_UNITS[@]}"; do
+        [ "$path" = "$UNIT_DIR/$name" ] && return 0
+    done
+    for name in "${LEGACY_FAN_BINS[@]}"; do
+        [ "$path" = "$BIN_DIR/$name" ] && return 0
+    done
+    return 1
+}
+
+is_fan_unit() {
+    local unit="$1" name
+    for name in "${ROLLBACK_FAN_UNITS[@]}"; do
+        [ "$unit" = "$name" ] && return 0
+    done
+    return 1
+}
+
+# rollback_touches_fan_artifacts - would putting the manifest back replace or
+# remove a fan binary or unit?
+#
+# Answered from the manifest and the current tree, not from the install-time
+# scope: the scope is what this run meant to change, and a rollback undoes
+# everything that was recorded. A transaction with no fan artifact in it - the
+# LCD-only install on a machine that has never had fan control - reaches no
+# gate and writes to no controller, which is the same rule verify_fan_handback
+# follows on the way in.
+rollback_touches_fan_artifacts() {
+    local path existed mode blob
+    while IFS=$'\t' read -r path existed mode blob; do
+        [ -n "$path" ] || continue
+        is_fan_artifact_path "$path" || continue
+        if [ "$existed" -eq 1 ]; then
+            if [ "$blob" != "-" ] && [ -f "$TXN_DIR/files/$blob" ]; then
+                return 0
+            fi
+        elif [ -e "$path" ]; then
+            return 0
+        fi
+    done < "$TXN_DIR/manifest.tsv"
+    return 1
+}
+
+# rollback_fan_gate - a fresh quiescence and handback verdict for the rollback
+# alone, in the only order that means anything: stop every fan unit that could
+# be running, prove no fan writer of any name survived it, and only then ask
+# the chip and read the answer back. Asking while a writer is alive is
+# answered by whichever of the two wrote last.
+rollback_fan_gate() {
+    local unit
+    warn "this rollback would restore or remove a fan binary or unit; proving"
+    warn "the fans are back under the controller before it touches either"
+    # Stale by construction: it was earned before install_files() replaced the
+    # binary and before a fan service was started again. Clearing it is what
+    # makes "nothing below reads it" true rather than merely likely.
+    FAN_HANDBACK_VERIFIED=0
+    for unit in "${ROLLBACK_FAN_UNITS[@]}"; do
+        unit_exists "$unit" || unit_is_active "$unit" || continue
+        if ! stop_unit_verified "$unit"; then
+            warn "$unit could not be stopped, so it may still be driving the fans"
+            return 1
+        fi
+    done
+    if ! wait_for_no_process "fan control" "${ROLLBACK_FAN_BINS[@]}"; then
+        warn "a fan writer is still running, so the controller cannot be asked"
+        return 1
+    fi
+    if ! fan_handback_now; then
+        warn "the fans could not be confirmed back in the controller's"
+        warn "automatic mode"
+        return 1
+    fi
+    return 0
+}
+
 rollback() {
     [ "$ROLLBACK_NEEDED" -eq 1 ] || return 0
     [ "$ROLLBACK_RUNNING" -eq 0 ] || return 0
     ROLLBACK_RUNNING=1
     # `set +e` alone does not remove an inherited ERR trap, so a failing
     # restore would re-enter on_error and recurse. Disarm it explicitly.
+    #
+    # No test can currently make this line matter, and that is not a coverage
+    # gap: rollback is only reached as `rollback || true`, and bash suppresses
+    # the ERR trap for everything under a command in a `||` list. Change that
+    # call shape and this line is the only thing preventing recursion, so it
+    # stays.
     trap - ERR
     set +e
 
@@ -1032,6 +1479,22 @@ rollback() {
         return 1
     fi
 
+    # 0. The fan gate, before any file is put back and before any unit is
+    #    touched. Everything below this point either restores a file or
+    #    changes what a unit is doing, and for a fan binary or unit both are
+    #    only safe once the chip demonstrably has the fans.
+    if rollback_touches_fan_artifacts; then
+        if rollback_fan_gate; then
+            ROLLBACK_FAN_GATE=1
+            ok "the fans are back under the controller; this rollback may restore them"
+        else
+            ROLLBACK_FAN_GATE=2
+            failures=$((failures + 1))
+            warn "no fan binary or unit will be restored or removed by this"
+            warn "rollback; everything else is still put back"
+        fi
+    fi
+
     local unit enabled active
     # 1. Undo enablement and activity this run introduced, before the files
     #    those units point at are replaced.
@@ -1049,6 +1512,13 @@ rollback() {
     local path existed mode blob
     while IFS=$'\t' read -r path existed mode blob; do
         [ -n "$path" ] || continue
+        if [ "$ROLLBACK_FAN_GATE" -eq 2 ] && is_fan_artifact_path "$path"; then
+            # Left exactly as this install wrote it. An unproven handback
+            # means a fan may be parked at a stall duty, and this file is how
+            # anyone would get it back.
+            ROLLBACK_SKIPPED_FAN+=("$path")
+            continue
+        fi
         if [ "$existed" -eq 1 ]; then
             if [ "$blob" != "-" ] && [ -f "$TXN_DIR/files/$blob" ]; then
                 mkdir -p "$(dirname "$path")" 2>/dev/null
@@ -1079,9 +1549,18 @@ rollback() {
 
     systemctl daemon-reload >/dev/null 2>&1 || failures=$((failures + 1))
 
-    # 4. Restore the enablement and activity that existed before.
+    # 4. Restore the enablement and activity that existed before. After step
+    #    2, never before it: a fan service is only started again once every
+    #    fan artifact this rollback intended to restore is back on disk, so it
+    #    cannot come up against a binary or a unit file that is still the one
+    #    the failed install wrote.
     while IFS=$'\t' read -r unit enabled active; do
         [ -n "$unit" ] || continue
+        if [ "$ROLLBACK_FAN_GATE" -eq 2 ] && is_fan_unit "$unit"; then
+            warn "not enabling or starting $unit: its binary and unit file were"
+            warn "left as this install wrote them"
+            continue
+        fi
         if [ "$enabled" -eq 1 ] && ! unit_is_enabled "$unit"; then
             systemctl enable "$unit" >/dev/null 2>&1 || failures=$((failures + 1))
         fi
@@ -1091,6 +1570,19 @@ rollback() {
             systemctl restart "$unit" >/dev/null 2>&1 || failures=$((failures + 1))
         fi
     done < "$TXN_DIR/units.tsv"
+
+    local skipped
+    if [ "${#ROLLBACK_SKIPPED_FAN[@]}" -gt 0 ]; then
+        warn "INCOMPLETE ROLLBACK: ${#ROLLBACK_SKIPPED_FAN[@]} fan path(s) were"
+        warn "left exactly as this install wrote them:"
+        for skipped in "${ROLLBACK_SKIPPED_FAN[@]}"; do
+            warn "  $skipped"
+        done
+        printf '%s\n' "${ROLLBACK_SKIPPED_FAN[@]}" \
+            > "$TXN_DIR/fan-rollback-skipped" 2>/dev/null || true
+        warn "recorded in $TXN_DIR/fan-rollback-skipped"
+        fan_handback_hint
+    fi
 
     if [ "$failures" -eq 0 ]; then
         warn "rollback complete; the previous state was restored"
@@ -1142,7 +1634,13 @@ install_files() {
         run install -m 0644 "$REPO_ROOT/systemd/qnap-tsx70-fancontrol.service" \
             "$UNIT_DIR/$NEW_FAN_UNIT"
         txn_mkdir "$(dirname "$MODULES_FILE")" 0755
-        run sh -c "printf 'coretemp\nf71882fg\n' > '$MODULES_FILE'"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '       [dry-run] write coretemp and f71882fg to %s\n' \
+                "$MODULES_FILE"
+        else
+            printf 'coretemp\nf71882fg\n' > "$MODULES_FILE"
+            chmod 0644 "$MODULES_FILE"
+        fi
         run modprobe f71882fg 2>/dev/null || warn "modprobe f71882fg failed"
         run modprobe coretemp 2>/dev/null || true
         ok "installed fan control (experimental)"
@@ -1181,6 +1679,26 @@ enable_services() {
             info "         qnap-tsx70-fancontrol calibrate --yes"
             info "         systemctl enable --now qnap-tsx70-fancontrol"
         fi
+        restore_fan_activity
+    fi
+}
+
+# restore_fan_activity - a fan service that was running when this install
+# started was stopped so its binary could be replaced. Leaving it down is a
+# change to the machine nobody asked for, so it goes back up. Without a valid
+# calibration it cannot: starting it would fail at once and burn the unit's
+# start limit, so that case is reported instead of guessed at.
+restore_fan_activity() {
+    [ "$FAN_UNIT_WAS_ACTIVE" -eq 1 ] || return 0
+    if cache_is_valid "$CACHE_FILE"; then
+        run systemctl restart "$NEW_FAN_UNIT"
+        ok "restarted $NEW_FAN_UNIT: it was active before this install"
+    else
+        warn "$NEW_FAN_UNIT was active before this install and was stopped to"
+        warn "replace its binary, but $CACHE_FILE does not validate, so it was"
+        warn "NOT restarted. Calibrate, then start it while you are watching:"
+        warn "  qnap-tsx70-fancontrol calibrate --yes"
+        warn "  systemctl start qnap-tsx70-fancontrol"
     fi
 }
 
@@ -1245,12 +1763,18 @@ main() {
     fi
     [ "$DRY_RUN" -eq 1 ] && info "dry run:    no changes will be made"
 
-    preflight
-    install_deps
-
     local legacy=0
     if [ "$MIGRATE" -eq 1 ] && detect_legacy; then
         legacy=1
+    fi
+    # Before preflight: the scope is what decides whether a legacy LCD holding
+    # the serial port is a planned transition or an unresolvable conflict.
+    plan_scope "$legacy"
+
+    preflight
+    install_deps
+
+    if [ "$legacy" -eq 1 ]; then
         step "Migrating legacy saturn-* installation"
     fi
 
@@ -1271,6 +1795,15 @@ main() {
 
     stop_current_services
     verify_port_released
+    # Here, and not earlier: stop_current_services is what proves every
+    # in-scope fan writer is gone, and asking the chip to take the fans back
+    # while one is still driving them would be answered by whichever of the
+    # two wrote last. Here, and not later: install_files replaces the current
+    # fan binary and remove_legacy deletes the legacy one, and those are the
+    # files this is protecting.
+    if ! verify_fan_handback; then
+        on_error 1
+    fi
     if [ "$legacy" -eq 1 ]; then
         migrate_cache
     fi
@@ -1308,8 +1841,12 @@ main() {
     if [ "$legacy" -eq 1 ]; then
         info ""
         info "Legacy saturn-* artifacts were migrated and removed."
-        if [ "$CACHE_PRESERVED" -eq 1 ]; then
-            info "The legacy calibration cache was NOT valid, so it was kept at"
+        if [ "$CACHE_PRESERVED_INVALID" -eq 1 ]; then
+            info "The legacy calibration cache did NOT validate, so it was kept at"
+            info "  $LEGACY_CACHE"
+        elif [ "$CACHE_SUPERSEDED" -eq 1 ]; then
+            info "A newer calibration was already in place, so the legacy cache"
+            info "was not migrated and was kept at"
             info "  $LEGACY_CACHE"
         fi
         info "Backup: $BACKUP_DIR (see docs/MIGRATION_FROM_SATURN.md)"

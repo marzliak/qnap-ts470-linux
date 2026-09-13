@@ -97,7 +97,7 @@ class PrintConfigTests(unittest.TestCase):
 
     def test_booleans_and_numbers_are_shell_readable(self):
         path = write_config(self, "smart_enabled = no\npage_interval = 7\n")
-        for key, expected in (("smart_enabled", "false"), ("page_interval", "7")):
+        for key, expected in (("smart_enabled", "false"), ("page_interval", "7.0")):
             with self.subTest(key=key):
                 result = subprocess.run(
                     ["python3", "bin/qnap-tsx70-lcd", "--config", path,

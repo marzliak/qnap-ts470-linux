@@ -144,16 +144,20 @@ class SafeStateClaimTests(UninstallCase):
         self.assertTrue(os.path.exists(marker), "safe-state was never invoked")
         self.assertIn("automatic mode (verified)", result.stdout)
 
-    def test_a_failing_safe_state_is_not_reported_as_automatic_mode(self):
+    def test_a_failing_safe_state_stops_the_uninstall(self):
+        # This used to warn and carry on, deleting the binary and the unit
+        # anyway - so the one command that could have put the fans back was
+        # removed precisely because it had reported that it could not.
         fixture = self._installed(fan_active=True)
         fixture.write(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"),
                       "#!/bin/sh\nexit 1\n", 0o755)
 
         result = fixture.uninstall()
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertArtifactsIntact(result)
         self.assertNotIn("automatic mode (verified)", result.stdout)
-        self.assertIn("NOT verified", result.stderr)
+        self.assertIn("NOT been", result.stderr)
+        self.assertIn("nothing was removed", result.stderr)
 
     def test_nothing_is_claimed_when_fan_control_was_never_installed(self):
         fixture = self.fixture
@@ -189,6 +193,70 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ArtifactGateTests(UninstallCase):
+    """Whatever the removal step deletes, the fan gate has to have seen."""
+
+    def test_a_non_executable_binary_is_still_gated(self):
+        # The gate tested `[ -x ]` while the removal tested `[ -f ]`, so a
+        # binary left mode 0644 skipped the whole quiescence check and was
+        # deleted anyway - out from under a live writer.
+        fixture = self.fixture
+        fixture.write(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"),
+                      "#!/bin/sh\nexit 0\n", 0o644)
+        fixture.add_process(8400, "python3", exe=fixture.python_stub_versioned,
+                            argv=["python3",
+                                  os.path.join(fixture.bin_dir,
+                                               "qnap-tsx70-fancontrol"),
+                                  "run"],
+                            linger=True)
+
+        result = fixture.uninstall()
+
+        self.assertNotEqual(result.returncode, 0,
+                            "a live writer did not stop the uninstall")
+        self.assertTrue(fixture.exists("usr/local/bin/qnap-tsx70-fancontrol"),
+                        "the fan binary was deleted under a live writer")
+        self.assertTrue(fixture.process_exists(8400))
+
+    def test_a_writer_with_no_artifacts_left_still_blocks(self):
+        # No unit, no binary, just a process. Nothing to remove, but the
+        # summary must not tell the operator the chip is in charge.
+        fixture = self.fixture
+        fixture.add_process(8401, "python3", exe=fixture.python_stub_versioned,
+                            argv=["python3",
+                                  "/usr/local/bin/qnap-tsx70-fancontrol",
+                                  "run"],
+                            linger=True)
+
+        result = fixture.uninstall()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("already in charge of the fans", result.stdout)
+
+    def test_a_clean_tree_with_no_fan_control_says_so(self):
+        fixture = self.fixture
+        fixture.write(os.path.join(fixture.bin_dir, "qnap-tsx70-lcd"),
+                      "#!/bin/sh\nexit 0\n", 0o755)
+        fixture.add_unit("qnap-tsx70-lcd.service", active=True, enabled=True)
+
+        result = fixture.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Fan control was not installed", result.stdout)
+
+    def test_a_dry_run_claims_neither_removal_nor_automatic_mode(self):
+        self._installed(fan_active=True)
+
+        result = self.fixture.uninstall("--dry-run")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("automatic mode (verified)", result.stdout,
+                         "a preview claimed a safe state it never asked for")
+        self.assertNotIn("ok   removed", result.stdout,
+                         "a preview reported removals it did not perform")
+        self.assertIn("Nothing was changed", result.stdout)
+
+
 class ReadOnlyProcessTests(UninstallCase):
     """A `status` in another terminal is not a reason to refuse."""
 
@@ -201,6 +269,107 @@ class ReadOnlyProcessTests(UninstallCase):
                                                     "qnap-tsx70-fancontrol"),
                                        "status"],
                                  linger=True)
+
+        result = self.fixture.uninstall()
+
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + "\n" + result.stderr)
+        self.assertFalse(self.fixture.exists("usr/local/bin/qnap-tsx70-fancontrol"))
+
+
+class FanCommandClassificationTests(UninstallCase):
+    """The command word decides, not whether a word appears somewhere in argv.
+
+    Asking whether *any* argv token equalled `status`, `validate-cache`,
+    `--version` or `--help` classified `qnap-tsx70-fancontrol run --sensor
+    status` - a live control loop - as read-only. The unit and the binary were
+    then removed under it, which is exactly the state this script exists to
+    prevent: a process driving PWM registers that systemd no longer knows
+    about and whose safe-state executable is gone.
+    """
+
+    def _writer(self, argv, pid=8600, linger=True):
+        self._installed(fan_active=False)
+        self.fixture.add_process(pid, "python3",
+                                 exe=self.fixture.python_stub_versioned,
+                                 argv=["python3",
+                                       os.path.join(self.fixture.bin_dir,
+                                                    "qnap-tsx70-fancontrol")]
+                                      + list(argv),
+                                 linger=linger)
+        return self.fixture
+
+    def assertRefused(self, result, pid=8600):
+        self.assertArtifactsIntact(result)
+        self.assertIn(str(pid), result.stderr)
+        self.assertTrue(self.fixture.process_exists(pid))
+        self.assertTrue(self.fixture.exists("etc/systemd/system/qnap-tsx70-lcd.service"),
+                        "the LCD unit went while a fan writer was alive")
+
+    def test_a_run_whose_sensor_is_called_status_still_blocks(self):
+        self._writer(["run", "--sensor", "status"])
+
+        result = self.fixture.uninstall()
+
+        self.assertRefused(result)
+
+    def test_the_equals_form_blocks_too(self):
+        self._writer(["run", "--sensor=status"])
+
+        result = self.fixture.uninstall()
+
+        self.assertRefused(result)
+
+    def test_a_cache_path_ending_in_a_read_only_word_is_no_defence(self):
+        self._writer(["run", "--cache", "/var/tmp/validate-cache"])
+
+        result = self.fixture.uninstall()
+
+        self.assertRefused(result)
+
+    def test_calibrate_blocks(self):
+        self._writer(["calibrate", "--yes", "--sensor", "status"])
+
+        result = self.fixture.uninstall()
+
+        self.assertRefused(result)
+
+    def test_safe_state_blocks(self):
+        # It writes registers too, and it is the command the recovery hint
+        # tells the operator to run - after this script has got out of the way.
+        self._writer(["safe-state", "--cache", "status"])
+
+        result = self.fixture.uninstall()
+
+        self.assertRefused(result)
+
+    def test_an_invocation_with_no_command_blocks(self):
+        self._writer([])
+
+        result = self.fixture.uninstall()
+
+        self.assertRefused(result)
+
+    def test_an_unknown_command_blocks(self):
+        self._writer(["tune", "--sensor", "status"])
+
+        result = self.fixture.uninstall()
+
+        self.assertRefused(result)
+
+    def test_a_status_with_its_own_options_is_still_read_only(self):
+        self._writer(["status", "--json", "--cache", "/x"])
+
+        result = self.fixture.uninstall()
+
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + "\n" + result.stderr)
+        self.assertFalse(self.fixture.exists("usr/local/bin/qnap-tsx70-fancontrol"))
+        self.assertTrue(self.fixture.process_exists(8600),
+                        "a read-only process was signalled")
+
+    def test_validate_cache_is_still_read_only(self):
+        self._writer(["validate-cache", "--cache", "/x/y.json"])
 
         result = self.fixture.uninstall()
 
@@ -223,3 +392,200 @@ class LoadedButFilelessUnitTests(UninstallCase):
         self.assertIn("stop qnap-tsx70-fancontrol.service",
                       self.fixture.calls(),
                       "a loaded unit with no file was never stopped")
+
+
+class SafeStateGateTests(UninstallCase):
+    """An unverified safe state is a gate, not a line in a summary.
+
+    These run the shipped `bin/qnap-tsx70-fancontrol` for real against a fake
+    f71882fg device, so what the uninstaller trusts is what safe-state
+    actually verifies rather than a stub that agrees with it.
+    """
+
+    def _with_chip(self, **chip):
+        fixture = self._installed(fan_active=True)
+        fixture.with_fan_chip(**chip)
+        return fixture
+
+    def assertNothingClaimed(self, result):
+        self.assertNotIn("(verified)", result.stdout,
+                         "automatic mode was claimed after it failed")
+        self.assertNotIn("ok   removed", result.stdout,
+                         "a removal was reported after the refusal")
+        self.assertIn("nothing was removed", result.stderr)
+        self.assertIn("safe-state", result.stderr,
+                      "the refusal gave no way to recover")
+
+    def test_a_verified_safe_state_lets_the_removal_proceed(self):
+        # The positive control: the same real binary, on a chip that takes the
+        # write. Without this the gate could be refusing for any reason.
+        fixture = self._with_chip(enable=1)
+
+        result = fixture.uninstall()
+
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + "\n" + result.stderr)
+        self.assertEqual(fixture.fan_register("pwm3_enable"), "2")
+        self.assertEqual(fixture.fan_register("pwm3"), "255")
+        self.assertIn("safe-state", " ".join(fixture.fan_commands()))
+        self.assertFalse(fixture.exists("usr/local/bin/qnap-tsx70-fancontrol"))
+        self.assertIn("automatic mode (verified)", result.stdout)
+
+    def test_a_retained_manual_readback_stops_the_uninstall(self):
+        # The chip took the write to pwm3_enable and stayed in manual mode.
+        fixture = self._with_chip(enable=1, ignore_writes=["pwm3_enable"])
+
+        result = fixture.uninstall()
+
+        self.assertArtifactsIntact(result)
+        self.assertNothingClaimed(result)
+        self.assertIn("still in mode 1", result.stderr)
+        self.assertEqual(fixture.fan_register("pwm3_enable"), "1")
+
+    def test_an_unreadable_mode_stops_the_uninstall(self):
+        # The register answers with nothing at all. "Unreadable" used to be
+        # accepted as automatic mode, which is the readback that matters least
+        # and the state that matters most.
+        fixture = self._with_chip(enable="", ignore_writes=["pwm3_enable"])
+
+        result = fixture.uninstall()
+
+        self.assertArtifactsIntact(result)
+        self.assertNothingClaimed(result)
+        self.assertIn("unreadable", result.stderr)
+
+    def test_a_chip_with_no_controllable_channel_stops_the_uninstall(self):
+        # Tachometers, no duty registers: nothing here can be handed back.
+        fixture = self._with_chip(controllable=False)
+
+        result = fixture.uninstall()
+
+        self.assertArtifactsIntact(result)
+        self.assertNothingClaimed(result)
+        self.assertIn("no controllable channel", result.stderr)
+
+    def test_a_failed_register_write_stops_the_uninstall(self):
+        fixture = self._with_chip(enable=1, fail_writes=["pwm3_enable"])
+
+        result = fixture.uninstall()
+
+        self.assertArtifactsIntact(result)
+        self.assertNothingClaimed(result)
+        self.assertIn("did not accept the safe-state write", result.stderr)
+
+    def test_one_bad_channel_out_of_three_stops_the_uninstall(self):
+        fixture = self._with_chip(channels=(1, 2, 3), enable=1,
+                                  ignore_writes=["pwm2_enable"])
+
+        result = fixture.uninstall()
+
+        self.assertArtifactsIntact(result)
+        self.assertNothingClaimed(result)
+        # Best effort first: the other two were still handed back.
+        for channel in (1, 3):
+            self.assertEqual(fixture.fan_register("pwm%d_enable" % channel), "2")
+
+    def test_a_safe_state_that_cannot_run_at_all_stops_the_uninstall(self):
+        # The binary is there - so the removal step would delete it - but it
+        # cannot be executed, so the gate cannot use it.
+        fixture = self._installed(fan_active=True)
+        os.chmod(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"), 0o644)
+
+        result = fixture.uninstall()
+
+        self.assertArtifactsIntact(result)
+        self.assertIn("not executable", result.stderr)
+        self.assertIn("nothing was removed", result.stderr)
+
+    def test_a_dry_run_previews_the_refusal_rather_than_a_handback(self):
+        # The preview has to say what the real run would do. Reporting a
+        # safe-state it would never be able to run is the same class of
+        # untruth as claiming one that failed.
+        fixture = self._installed(fan_active=True)
+        os.chmod(os.path.join(fixture.bin_dir, "qnap-tsx70-fancontrol"), 0o644)
+        before = fixture.snapshot()
+
+        result = fixture.uninstall("--dry-run")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fixture.snapshot(), before)
+        self.assertIn("would refuse", result.stdout)
+        self.assertNotIn("(verified)", result.stdout)
+
+    def test_the_lcd_is_left_alone_when_the_gate_trips(self):
+        # Transactional: the run stops before the LCD service is touched
+        # rather than half-uninstalling the machine.
+        fixture = self._with_chip(enable=1, ignore_writes=["pwm3_enable"])
+
+        result = fixture.uninstall()
+
+        self.assertArtifactsIntact(result)
+        self.assertTrue(fixture.exists("etc/systemd/system/qnap-tsx70-lcd.service"))
+        self.assertNotIn("stop qnap-tsx70-lcd.service", fixture.calls(),
+                         "the LCD was stopped by a run that then refused")
+
+    def test_a_leftover_unit_with_no_binary_is_removed_without_a_claim(self):
+        # Nothing to execute and nothing to keep: there is no binary to be a
+        # recovery mechanism. The unit goes, and the summary says plainly that
+        # automatic mode was never confirmed.
+        fixture = self.fixture
+        fixture.add_unit("qnap-tsx70-fancontrol.service", active=False,
+                         enabled=True)
+
+        result = fixture.uninstall()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            fixture.exists("etc/systemd/system/qnap-tsx70-fancontrol.service"))
+        self.assertNotIn("(verified)", result.stdout)
+        self.assertIn("NOT verified", result.stderr)
+
+
+class FanOnlyTests(UninstallCase):
+    """--fan-only is the documented way to remove just fan control."""
+
+    def test_only_the_fan_artifacts_go(self):
+        fixture = self._with_lcd_and_fan()
+
+        result = fixture.uninstall("--fan-only")
+
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + "\n" + result.stderr)
+        self.assertFalse(fixture.exists("usr/local/bin/qnap-tsx70-fancontrol"))
+        self.assertFalse(
+            fixture.exists("etc/systemd/system/qnap-tsx70-fancontrol.service"))
+        self.assertTrue(fixture.exists("usr/local/bin/qnap-tsx70-lcd"),
+                        "--fan-only removed the LCD binary")
+        self.assertTrue(
+            fixture.exists("etc/systemd/system/qnap-tsx70-lcd.service"),
+            "--fan-only removed the LCD unit")
+        self.assertTrue(fixture.exists("etc/qnap-tsx70-lcd.conf"))
+        self.assertNotIn("stop qnap-tsx70-lcd.service", fixture.calls(),
+                         "--fan-only stopped the LCD service")
+
+    def test_an_unverified_safe_state_removes_nothing(self):
+        fixture = self._with_lcd_and_fan(enable=1,
+                                         ignore_writes=["pwm3_enable"])
+
+        result = fixture.uninstall("--fan-only")
+
+        self.assertArtifactsIntact(result)
+        self.assertIn("nothing was removed", result.stderr)
+
+    def test_purge_with_fan_only_keeps_the_lcd_configuration(self):
+        fixture = self._with_lcd_and_fan()
+        fixture.write(os.path.join(fixture.state_dir, "fan-calibration.json"),
+                      "{}\n")
+
+        result = fixture.uninstall("--fan-only", "--purge")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(fixture.exists("etc/qnap-tsx70-lcd.conf"),
+                        "--fan-only --purge deleted the LCD configuration")
+        self.assertFalse(fixture.exists("var/lib/qnap-tsx70"))
+
+    def _with_lcd_and_fan(self, **chip):
+        fixture = self._installed(fan_active=True)
+        fixture.with_config()
+        fixture.with_fan_chip(**chip)
+        return fixture
