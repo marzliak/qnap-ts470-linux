@@ -37,12 +37,31 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(lcd.fmt_bytes(None), "N/A")
         self.assertEqual(lcd.fmt_bytes("abc"), "N/A")
 
-    def test_fmt_thousands(self):
-        self.assertEqual(lcd.fmt_thousands(0), "0")
-        self.assertEqual(lcd.fmt_thousands(999), "999")
-        self.assertEqual(lcd.fmt_thousands(1000), "1.000")
-        self.assertEqual(lcd.fmt_thousands(16384), "16.384")
-        self.assertEqual(lcd.fmt_thousands(None), "N/A")
+    def test_fmt_gib(self):
+        self.assertEqual(lcd.fmt_gib(16384), "16.0")
+        self.assertEqual(lcd.fmt_gib(3204), "3.1")
+        self.assertEqual(lcd.fmt_gib(131072), "128")
+        self.assertIsNone(lcd.fmt_gib(None))
+        self.assertIsNone(lcd.fmt_gib("lots"))
+
+    def test_fmt_gib_never_exceeds_five_characters(self):
+        for mib in (0, 512, 16384, 131072, 1048576, 16777216):
+            self.assertLessEqual(len(lcd.fmt_gib(mib)), 5, mib)
+
+    def test_fmt_load_trades_precision_for_width(self):
+        self.assertEqual(lcd.fmt_load("0.31"), "0.31")
+        self.assertEqual(lcd.fmt_load("9.99"), "9.99")
+        self.assertEqual(lcd.fmt_load("12.34"), "12.3")
+        self.assertEqual(lcd.fmt_load("123.4"), "123")
+        self.assertEqual(lcd.fmt_load("4321"), "4321")
+        self.assertEqual(lcd.fmt_load("99999"), "999+")
+        self.assertEqual(lcd.fmt_load(None), "N/A")
+        self.assertEqual(lcd.fmt_load("busy"), "N/A")
+
+    def test_fmt_load_never_exceeds_four_characters(self):
+        for value in ("0.00", "9.99", "10.5", "99.99", "100", "999", "1000",
+                      "4321", "99999", "1234567"):
+            self.assertLessEqual(len(lcd.fmt_load(value)), 4, value)
 
     def test_fmt_uptime_units(self):
         self.assertEqual(lcd.fmt_uptime(59), "0m")
@@ -89,6 +108,17 @@ class PageRenderTests(unittest.TestCase):
         self.assertIn("N/A", line1)
         self.assertIn("N/A", line2)
 
+    def test_ram_line_fits_on_a_large_memory_machine(self):
+        # 16 GiB rendered as dotted mebibytes was 18 characters, so the row was
+        # silently truncated on the reference machine itself.
+        _, line2 = lcd.page_cpu({"mem_used": 16000, "mem_total": 16384})
+        self.assertLessEqual(len(line2), 16)
+        self.assertEqual(line2, "RAM 15.6/16.0G")
+
+    def test_ram_line_when_memory_is_unreadable(self):
+        _, line2 = lcd.page_cpu({"mem_used": None, "mem_total": None})
+        self.assertEqual(line2, "RAM N/A")
+
     def test_fan_page_reports_the_active_channel_not_a_fixed_one(self):
         # The reference unit drives channel 3, so nothing may hard-code 2.
         line1, _ = lcd.page_fan(FULL_SNAPSHOT)
@@ -121,8 +151,8 @@ class DetailPageTests(unittest.TestCase):
                  "temp": 34, "hours": 15000, "cycles": 42, "realloc": 0,
                  "pending": 0, "health": "OK"}
 
-    def test_four_pages_are_produced(self):
-        self.assertEqual(len(lcd.detail_pages(self.FULL_DISK)), 4)
+    def test_pages_are_produced(self):
+        self.assertEqual(len(lcd.detail_pages(self.FULL_DISK)), 5)
 
     def test_pages_fit_the_panel(self):
         for page in lcd.detail_pages(self.FULL_DISK):
@@ -130,7 +160,18 @@ class DetailPageTests(unittest.TestCase):
 
     def test_reallocated_sectors_raise_a_warning_marker(self):
         disk = dict(self.FULL_DISK, realloc=7)
-        self.assertIn("R:7!", lcd.detail_pages(disk)[0])
+        pages = lcd.detail_pages(disk)
+        self.assertTrue(pages[0].endswith("!"), pages[0])
+        self.assertIn("7", pages[2])
+
+    def test_warning_marker_is_dropped_rather_than_overflowing(self):
+        # At the widest plausible summary there is no column left for it, and
+        # the count is still reported on its own page.
+        disk = {"size": "999.9T", "temp": 100, "health": "FAIL", "realloc": 9}
+        pages = lcd.detail_pages(disk)
+        self.assertEqual(len(pages[0]), 16)
+        self.assertFalse(pages[0].endswith("!"))
+        self.assertIn("9", pages[2])
 
     def test_no_warning_when_clean(self):
         self.assertNotIn("!", lcd.detail_pages(self.FULL_DISK)[0])
@@ -139,18 +180,18 @@ class DetailPageTests(unittest.TestCase):
         # USB bridges and some NVMe devices report nothing useful.
         disk = {"name": "sdb", "size": "1.8T"}
         pages = lcd.detail_pages(disk)
-        self.assertEqual(len(pages), 4)
+        self.assertEqual(len(pages), 5)
         self.assertIn("N/A", pages[1])
 
     def test_completely_empty_disk_record(self):
         pages = lcd.detail_pages({})
-        self.assertEqual(len(pages), 4)
+        self.assertEqual(len(pages), 5)
         for page in pages:
             self.assertEqual(len(lcd.pad_line(page)), 16)
 
     def test_non_numeric_realloc_does_not_raise(self):
         disk = dict(self.FULL_DISK, realloc="unknown")
-        self.assertEqual(len(lcd.detail_pages(disk)), 4)
+        self.assertEqual(len(lcd.detail_pages(disk)), 5)
 
 
 class HwmonDiscoveryTests(unittest.TestCase):
@@ -399,3 +440,62 @@ class CliTests(unittest.TestCase):
     def test_default_config_path(self):
         self.assertEqual(lcd.build_parser().parse_args([]).config,
                          lcd.DEFAULT_CONFIG_PATH)
+
+
+class RowWidthTests(unittest.TestCase):
+    """No page may overflow 16 columns at any plausible value.
+
+    Truncation is silent, so an overflow removes information without any
+    visible sign that it happened - which is how the year lost a digit from the
+    clock and the RAM row lost its unit.
+    """
+
+    WORST = {
+        "hostname": "A" * 16,
+        "ip": "255.255.255.255",
+        "cpu_temp": 100, "board_temp": 100, "nic_temp": 100,
+        "load": "999.99",
+        "mem_used": 16777215, "mem_total": 16777216,   # 16 TiB
+        "uptime": 9999 * 86400,
+        "cpu_pct": 100,
+        "datetime": "31/12/2026 23:59",
+        "fan_channels": {10: {"rpm": 99999, "pwm": 255, "percent": 100},
+                         11: {"rpm": 99999, "pwm": 255, "percent": 100}},
+        "rx_rate": 999_999_999_999, "tx_rate": 999_999_999_999,
+        "disk_count": 9999,
+    }
+
+    def test_every_page_fits_at_worst_case_values(self):
+        for name, func in lcd.PAGES.items():
+            for row, line in enumerate(func(self.WORST)):
+                with self.subTest(page=name, row=row):
+                    self.assertLessEqual(
+                        len(line), 16,
+                        "page %r row %d renders %d chars: %r"
+                        % (name, row, len(line), line))
+
+    def test_every_page_fits_with_a_single_active_fan(self):
+        snapshot = dict(self.WORST,
+                        fan_channels={3: {"rpm": 99999, "pwm": 255,
+                                          "percent": 100}})
+        for name, func in lcd.PAGES.items():
+            for line in func(snapshot):
+                self.assertLessEqual(len(line), 16, "%s: %r" % (name, line))
+
+    def test_detail_pages_fit_at_worst_case_values(self):
+        disk = {"name": "nvme0n1", "size": "999.9T", "temp": 100,
+                "health": "FAIL", "model": "M" * 40, "hours": 999999,
+                "cycles": 99999, "realloc": 65535, "pending": 65535}
+        pages = lcd.detail_pages(disk)
+        # The model is free text and is allowed to truncate; the rest is not.
+        for index, page in enumerate(pages):
+            if index == 1:
+                continue
+            self.assertLessEqual(len(page), 16,
+                                 "detail page %d renders %d chars: %r"
+                                 % (index + 1, len(page), page))
+
+    def test_detail_header_row_fits(self):
+        for name in ("sda", "nvme0n1", "mmcblk0"):
+            header = "[%s] %d/%d" % (name, 5, 5)
+            self.assertLessEqual(len(header), 16, header)

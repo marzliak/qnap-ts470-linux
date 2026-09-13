@@ -279,19 +279,37 @@ def fmt_bytes(value):
     return "%s%dB" % (neg, n)
 
 
-def fmt_thousands(value, sep="."):
+def fmt_gib(mebibytes):
+    """Mebibytes as a compact gibibyte string, or None when unavailable.
+
+    Returns at most 5 characters so two of them plus a label still fit a row.
+    """
     try:
-        n = int(value)
+        value = int(mebibytes) / 1024.0
+    except (TypeError, ValueError):
+        return None
+    if value >= 100:
+        return "%.0f" % value
+    return "%.1f" % value
+
+
+def fmt_load(value):
+    """Load average in at most 4 characters.
+
+    Precision is traded for width as the number grows: a busy machine must not
+    push the temperature off the row.
+    """
+    if value is None or value == "":
+        return NA
+    try:
+        load = float(value)
     except (TypeError, ValueError):
         return NA
-    sign = "-" if n < 0 else ""
-    digits = str(abs(n))
-    groups = []
-    while len(digits) > 3:
-        groups.insert(0, digits[-3:])
-        digits = digits[:-3]
-    groups.insert(0, digits)
-    return sign + sep.join(groups)
+    for fmt in ("%.2f", "%.1f", "%.0f"):
+        text = fmt % load
+        if len(text) <= 4:
+            return text
+    return "999+"
 
 
 def fmt_uptime(seconds):
@@ -665,16 +683,21 @@ def page_host(s):
 
 
 def page_cpu(s):
-    return ("CPU:%s Load:%s" % (fmt_value(s.get("cpu_temp"), "C"),
-                                fmt_value(s.get("load"))),
-            "RAM %s/%sM" % (fmt_thousands(s.get("mem_used")),
-                            fmt_thousands(s.get("mem_total"))))
+    used = fmt_gib(s.get("mem_used"))
+    total = fmt_gib(s.get("mem_total"))
+    ram = ("RAM %s" % NA if used is None or total is None
+           else "RAM %s/%sG" % (used, total))
+    return ("CPU:%s L:%s" % (fmt_value(s.get("cpu_temp"), "C"),
+                             fmt_load(s.get("load"))),
+            ram)
 
 
 def page_uptime(s):
-    count = s.get("disk_count")
-    return ("Uptime:%s" % fmt_uptime(s.get("uptime")),
-            "%s disks online" % (NA if count is None else count))
+    count = NA if s.get("disk_count") is None else str(s["disk_count"])
+    line2 = "%s disks online" % count
+    if len(line2) > LCD_COLS:
+        line2 = "Disks: %s" % count
+    return ("Uptime:%s" % fmt_uptime(s.get("uptime")), line2)
 
 
 def page_cpuload(s):
@@ -688,15 +711,12 @@ def page_fan(s):
     channels = s.get("fan_channels") or {}
     active = active_fan_channels(channels)
     if not active:
-        return ("Fan: %s" % NA, "no active channel")
+        return ("Fan: %s" % NA, "no fan detected")
     first = channels[active[0]]
     line1 = "Fan%d: %s RPM" % (active[0], first.get("rpm", NA))
     if len(active) > 1:
         second = channels[active[1]]
-        pct = second.get("percent")
-        line2 = "Fan%d: %s RPM %s" % (active[1], second.get("rpm", NA),
-                                      "" if pct is None else "%d%%" % pct)
-        return (line1, line2.strip())
+        return (line1, "Fan%d: %s RPM" % (active[1], second.get("rpm", NA)))
     pct = first.get("percent")
     return (line1, "Duty: %s" % (NA if pct is None else "%d%%" % pct))
 
@@ -707,8 +727,8 @@ def page_net(s):
 
 
 def page_temps(s):
-    return ("CPU:%s Board:%s" % (fmt_value(s.get("cpu_temp"), "C"),
-                                 fmt_value(s.get("board_temp"), "C")),
+    return ("CPU:%s Bd:%s" % (fmt_value(s.get("cpu_temp"), "C"),
+                              fmt_value(s.get("board_temp"), "C")),
             "NIC:%s" % fmt_value(s.get("nic_temp"), "C"))
 
 
@@ -728,20 +748,26 @@ def detail_pages(disk):
     realloc = disk.get("realloc")
     warn = ""
     try:
+        # Just a marker here; the count itself is on page 3.
         if realloc is not None and int(realloc) > 0:
-            warn = " R:%s!" % realloc
+            warn = "!"
     except (TypeError, ValueError):
         pass
+    # The device name is already on the header row, so it is not repeated.
+    summary = "%s %s %s" % (disk.get("size") or NA,
+                            fmt_value(disk.get("temp"), "C"),
+                            disk.get("health") or NA)
+    # Surface the warning on the summary page when there is room for it; the
+    # count itself is always on the reallocated-sectors page either way.
+    if warn and len(summary) < LCD_COLS:
+        summary += warn
     return [
-        "%s %s %s %s%s" % (disk.get("name") or NA,
-                           disk.get("size") or NA,
-                           fmt_value(disk.get("temp"), "C"),
-                           disk.get("health") or NA, warn),
+        summary,
         disk.get("model") or NA,
-        "%sh Re:%s P:%s" % (fmt_value(disk.get("hours")),
-                            fmt_value(disk.get("realloc")),
-                            fmt_value(disk.get("pending"))),
-        "Cycles:%s" % fmt_value(disk.get("cycles")),
+        "Realloc:%s%s" % (fmt_value(disk.get("realloc")), warn),
+        "Pending:%s" % fmt_value(disk.get("pending")),
+        "%sh %sc" % (fmt_value(disk.get("hours")),
+                     fmt_value(disk.get("cycles"))),
     ]
 
 
@@ -809,7 +835,9 @@ class Monitor:
         self.buttons = ButtonParser()
         self.snapshot = {}
         self.disks = []
-        self._prev_ticks = None
+        # Primed here so the first rendered page shows a real utilisation
+        # figure rather than N/A for one cycle.
+        self._prev_ticks = read_cpu_ticks()
         self._prev_net = None
         self._prev_net_time = None
         self._cpu_paths = {}
@@ -1004,7 +1032,9 @@ def run(conf):
         elif code == BTN_ENTER:
             state["selects"] = []
             if state["mode"] == "detail":
-                state["detail_page"] = (state["detail_page"] + 1) % 4
+                pages = len(detail_pages(monitor.disks[state["disk_idx"]])) \
+                    if monitor.disks else 1
+                state["detail_page"] = (state["detail_page"] + 1) % pages
             elif monitor.disks:
                 enter_detail()
             state["last_button"] = now
@@ -1079,10 +1109,11 @@ def run(conf):
             else:
                 disk = monitor.disks[state["disk_idx"]]
                 pages = detail_pages(disk)
+                index = state["detail_page"] % len(pages)
                 device.write_lines(
-                    "[%s] pg %d/4" % (disk.get("name") or "?",
-                                      state["detail_page"] + 1),
-                    pages[state["detail_page"]])
+                    "[%s] %d/%d" % (disk.get("name") or "?",
+                                    index + 1, len(pages)),
+                    pages[index])
                 time.sleep(0.3)
     finally:
         device.close()

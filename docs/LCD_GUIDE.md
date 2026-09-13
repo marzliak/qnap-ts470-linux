@@ -453,7 +453,7 @@ smart_enabled = false
 | Page | Row 1 | Row 2 |
 |---|---|---|
 | `host` | Hostname | IP address of the default route |
-| `cpu` | CPU temperature and load average | RAM used / total, in MiB |
+| `cpu` | CPU temperature and load average | RAM used / total, in GiB |
 | `uptime` | Uptime | Number of disks online |
 | `cpuload` | CPU utilisation percentage | Date and time |
 | `fan` | RPM of the first turning fan channel | Second channel, or duty percentage |
@@ -477,7 +477,7 @@ report a temperature, no fan controller found. The service keeps running.
 
 | Action | Effect |
 |---|---|
-| **ENTER** | Enter disk detail mode; press again to cycle the four pages for the current disk |
+| **ENTER** | Enter disk detail mode; press again to cycle the pages for the current disk |
 | **SELECT** | Next disk; after the last one, return to automatic rotation |
 | **SELECT three times within 1.5 s** | Switch the backlight off |
 | **Any button while the backlight is off** | Wake it, without performing the action |
@@ -493,10 +493,15 @@ the daemon.
 
 | Page | Content |
 |---|---|
-| 1 | Device name, size, temperature, SMART health, plus `R:n!` if any sectors have been reallocated |
+| 1 | Size, temperature and SMART health, plus `!` if any sectors have been reallocated |
 | 2 | Device model |
-| 3 | Power-on hours, reallocated sectors, pending sectors |
-| 4 | Power cycle count |
+| 3 | Reallocated sector count |
+| 4 | Pending sector count |
+| 5 | Power-on hours and power cycle count |
+
+The device name is on the header row rather than repeated on each page. Each
+row is 16 columns, so counts get a row of their own instead of being packed
+together where a large raw SMART value would truncate the line.
 
 Detail mode returns to automatic rotation after `detail_timeout` seconds
 without a press.
