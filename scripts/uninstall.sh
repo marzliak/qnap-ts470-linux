@@ -86,9 +86,11 @@ done
 
 step "Clearing the display"
 if [ -x "$BIN_DIR/qnap-tsx70-lcd" ] && [ "$DRY_RUN" -eq 0 ]; then
-    "$BIN_DIR/qnap-tsx70-lcd" --clear >/dev/null 2>&1 \
-        && ok "display cleared and backlight off" \
-        || warn "could not clear the display (panel may keep the last text)"
+    if "$BIN_DIR/qnap-tsx70-lcd" --clear >/dev/null 2>&1; then
+        ok "display cleared and backlight off"
+    else
+        warn "could not clear the display (panel may keep the last text)"
+    fi
 else
     info "       [dry-run] clear display"
 fi

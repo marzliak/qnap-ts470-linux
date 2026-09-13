@@ -16,7 +16,7 @@ lcd = load_lcd()
 EMPTY_SNAPSHOT = {}
 
 FULL_SNAPSHOT = {
-    "hostname": "NAS", "ip": "10.0.0.2", "cpu_temp": 41, "board_temp": 38,
+    "hostname": "NAS", "ip": "192.0.2.10", "cpu_temp": 41, "board_temp": 38,
     "nic_temp": 52, "load": "0.31", "mem_used": 3204, "mem_total": 16384,
     "uptime": 93784.0, "cpu_pct": 7, "datetime": "12:30 12/Sep/2026",
     "fan_channels": {1: {"rpm": 0, "pwm": 0, "percent": 0},

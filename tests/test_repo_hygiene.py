@@ -161,7 +161,8 @@ class PrivacyTests(unittest.TestCase):
     }
 
     # Documentation legitimately shows these as examples or placeholders.
-    ALLOWED_LITERALS = ("192.0.2.1", "10.0.0.2", "0.0.0.0")
+    # RFC 5737 documentation addresses only; no real address appears anywhere.
+    ALLOWED_LITERALS = ("192.0.2.1", "192.0.2.10", "0.0.0.0")
 
     def test_no_identifying_values_in_tracked_files(self):
         findings = []
