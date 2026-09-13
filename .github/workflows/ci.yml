@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Least privilege: nothing here needs to write to the repository.
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python compile and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile every Python executable
+        run: python3 -m py_compile bin/qnap-tsx70-lcd bin/qnap-tsx70-fancontrol
+
+      - name: Run the test suite
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+  shell:
+    name: Shell syntax and ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n on every shell script
+        run: |
+          set -eu
+          for script in scripts/*.sh; do
+            echo "checking $script"
+            bash -n "$script"
+          done
+
+      # Pre-installed on ubuntu-latest runners. This is the only place
+      # ShellCheck runs: it is not available in every local environment.
+      - name: ShellCheck
+        run: shellcheck --severity=warning scripts/*.sh
+
+  units:
+    name: systemd unit validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate unit files without installing them
+        run: |
+          set -eu
+          # systemd-analyze verify reports a missing ExecStart binary because
+          # nothing is installed on the runner; that one message is expected.
+          # Any other complaint is a real syntax or key error.
+          output="$(systemd-analyze verify systemd/*.service 2>&1 || true)"
+          echo "$output"
+          filtered="$(echo "$output" | grep -v 'is not executable' || true)"
+          if [ -n "$filtered" ]; then
+            echo "::error::systemd-analyze reported unexpected problems"
+            exit 1
+          fi
+
+  static:
+    name: Documentation and hygiene checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Standard library only, no third-party link checker: a network-dependent
+      # action would make CI fail for reasons unrelated to the change.
+      - name: Repository hygiene, local links, privacy and naming
+        run: python3 -m unittest discover -s tests -p 'test_repo_*.py' -v
