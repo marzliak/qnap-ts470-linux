@@ -1,23 +1,23 @@
 # Compatibility
 
-This project is validated on **one** machine. Everything else on this page is
-an evidence-based estimate, and estimates are labelled as such.
+Hardware behaviour was observed on **one reference TS-470 Pro** with the
+earlier implementation. Other models are estimates based on published
+specifications, not confirmed compatibility.
 
-> **Version 2.0.0 has not been executed on any TS-x70.** The rows below record
-> what the *hardware* was observed to do, under the implementation that this
-> release replaces. The current code has been validated offline only. A report
-> confirming 2.0.0 itself on a TS-470 Pro is the single most useful thing
-> anyone could contribute right now.
+**The current implementation has been validated offline only, not on physical
+TS-x70 hardware.** The feature matrix records earlier hardware observations;
+it does not establish acceptance of the current binaries or installer.
 
 ## How to read the status column
 
 | Status | Meaning |
 |---|---|
-| **Tested** | The capability was exercised on the reference machine, with the distribution and kernel recorded below. This describes the hardware, not the 2.0.0 code — see the note above. |
+| **Tested** | The hardware capability was exercised on the reference machine with the earlier implementation, distribution and kernel recorded below. It does not mean the current implementation has passed hardware acceptance. |
 | **Unverified** | No test report exists. The estimate is based on published specifications and on how the hardware is built, not on someone running it. |
 | **Unlikely** | Published evidence actively points away from the feature being present. |
 
-"Unverified" is not a soft "yes". Nobody has run it.
+"Unverified" means no hardware test report is recorded for that model or
+capability; it is not a compatibility guarantee.
 
 ---
 
@@ -61,9 +61,9 @@ as unlikely until somebody demonstrates otherwise.
 
 ## 3. The tested reference machine
 
-The reference system is described as "the reference TS-470 Pro" throughout this
-repository. Its hostname, addresses and device serial numbers are deliberately
-not published.
+The configuration below records the reference TS-470 Pro observed on
+**2026-09-12**. It is a hardware reference, not a current inventory or a set of
+minimum requirements.
 
 ### As shipped by QNAP
 
@@ -81,10 +81,10 @@ and [Intel Core i3-3220 product specification](https://www.intel.com/content/www
 The archived QNAP page is linked rather than the live one because QNAP's site
 does not reliably serve its specification pages to automated clients.
 
-### As currently configured — this is a modified machine
+### Observed reference configuration — modified machine
 
-The reference unit is **not** stock. Read this section as "what the maintainer
-happens to run", not as a requirement.
+The reference unit is **not** stock. This is the recorded reference setup,
+not a required configuration.
 
 | Component | Installed | Stock? |
 |---|---|---|
@@ -136,10 +136,9 @@ exposes three channels regardless of how many are wired. Which channel carries
 the fan depends on the header it is plugged into, and the reference unit has
 had its fan replaced at least once.
 
-Earlier revisions of this repository described channel 2 as "the" chassis fan.
-That was true of one machine at one point in time. It is not a property of the
-TS-x70 family, and nothing in this project hard-codes a channel any more:
-channels are discovered by reading the tachometers.
+The channel number is not a property of the TS-x70 family. The software
+discovers active channels from tachometer readings rather than hard-coding
+the reference unit's wiring.
 
 The Super I/O chip is identified through the `f71882fg` kernel driver binding
 on the reference unit. That driver serves a family of Fintek parts, so another
@@ -151,7 +150,7 @@ unit could expose a different but driver-compatible variant.
 
 | Distribution | Status |
 |---|---|
-| Ubuntu 24.04 LTS | Tested |
+| Ubuntu 24.04 LTS | Reference hardware observed with the earlier implementation; current software validated offline only |
 | Other systemd-based distributions | Unverified - the requirements are Python 3.9+, systemd, and optionally `smartmontools` and `util-linux` |
 | Non-systemd init | Unverified - the binaries do not depend on systemd, but the units and installer do |
 | QTS (QNAP's own firmware) | Out of scope |
@@ -160,12 +159,14 @@ unit could expose a different but driver-compatible variant.
 
 ## 5. Contributing a report
 
-Reports are welcome for any model, including "it did not work". A negative
-result on a TS-670 Pro is more useful than more confirmation of the TS-470 Pro.
+Reports are welcome for any model, including negative results. Validation of
+the current software on the reference TS-470 Pro is still needed; reports from
+other models help establish their compatibility separately.
 
 Please include:
 
-1. Your exact model, and whether it is a Pro.
+1. Your exact model, whether it is a Pro, and the tested software version or
+   Git commit.
 2. Distribution and `uname -r`.
 3. Output of `sudo qnap-tsx70-lcd --check`.
 4. Whether text appeared on the display, and whether ENTER and SELECT worked.

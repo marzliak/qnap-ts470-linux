@@ -53,18 +53,20 @@ Read these before deciding to use it.
    cools the *disks*. Four warm drives under an idle CPU will currently produce
    a low fan speed. If your workload is disk-heavy and CPU-light, this
    controller is not a good fit as-is.
-2. **Single-machine calibration.** The stall and restart duties are measured on
-   your fan, which is good, but the measurement procedure itself has only been
-   exercised on one machine and one fan.
+2. **Calibration needs hardware validation.** The previous implementation
+   measured stall and restart duties on one machine and one fan. The current
+   calibration implementation has been exercised offline only; its results
+   have not been validated on a physical fan.
 3. **The duty floor is a safety bias, not a measurement.** During normal
    operation the program never commands a duty below `PWM_FLOOR` (64), even if
    calibration measured a lower stall point: a fan parked at its own stall
    threshold has no margin for dust, wear or a warm day. Calibration itself is
    the exception — it has to go below the floor and to zero to find where the
    fan stops, which is the whole hazard described in [§6](#6-calibration-hazard).
-4. **The chip's own automatic mode is the fallback, not a guarantee.** Every
-   failure path hands the fan back to `pwm*_enable = 2`. What that mode does is
-   a property of your board's firmware, not of this program.
+4. **The chip's own automatic mode is the fallback, not a guarantee.** Failure
+   handling attempts to return the fan to `pwm*_enable = 2` and reports an error
+   if that state cannot be confirmed. What automatic mode does is a property
+   of your board's firmware, not of this program.
 5. **No disk temperature input, no hysteresis, no PID.** The curve is a
    straight line between two temperatures.
 
