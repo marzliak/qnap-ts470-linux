@@ -69,8 +69,10 @@ independently:
 Only the first two are strictly the LCD. The last two degrade to `N/A` and
 never stop the service.
 
-**Tested on the TS-470 Pro only.** See
-[COMPATIBILITY.md](COMPATIBILITY.md) before assuming your model works.
+**Hardware behaviour was observed on the TS-470 Pro with the earlier
+implementation. The current software has been validated offline only, not on
+physical TS-x70 hardware.** See [COMPATIBILITY.md](COMPATIBILITY.md) for the
+evidence and unverified models.
 
 ---
 
@@ -135,8 +137,8 @@ sudo ./scripts/install.sh --dry-run
 
 | Requirement | Notes |
 |---|---|
-| A QNAP TS-x70 with the front LCD | Tested: TS-470 Pro. Others unverified. |
-| Linux with systemd | Tested: Ubuntu 24.04 LTS |
+| A QNAP TS-x70 with the front LCD | Reference hardware: TS-470 Pro with the earlier implementation. Current software needs hardware validation; other models are unverified. |
+| Linux with systemd | Reference observations: Ubuntu 24.04 LTS; not hardware acceptance of the current software |
 | Python 3.9 or newer | Standard library only, no pip packages |
 | `root` / `sudo` | Needed for the serial port and for SMART |
 | `smartmontools` | Optional — disk pages show `N/A` without it |

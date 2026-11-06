@@ -1,43 +1,14 @@
 # QNAP TS-x70 on Linux — front LCD, sensors and fan control
 
-Bring the front-panel LCD of a QNAP TS-x70 NAS back to life after replacing QTS
-with a normal Linux distribution, and read the hardware sensors while you are
-at it.
-
-The hardware is still good. This project keeps the parts of it that stop
-working the moment you install your own OS.
+Use the front-panel LCD of a QNAP TS-x70 NAS after replacing QTS with a normal
+Linux distribution. Display system information, read hardware sensors and
+browse disk health from the front-panel buttons.
 
 [![CI](https://github.com/marzliak/qnap-ts470-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/marzliak/qnap-ts470-linux/actions/workflows/ci.yml)
 
----
-
-## ⚠️ Tested on exactly one machine
-
-| | |
-|---|---|
-| **Tested** | QNAP **TS-470 Pro**, Ubuntu 24.04 LTS, kernel 7.0 series |
-| **Unverified** | TS-670 Pro, TS-870 Pro, TS-470 / TS-670 / TS-870 (non-Pro) |
-| **Unlikely** | TS-470U-RP — QNAP's own product page does not list an LCD |
-
-Everything outside the first row is an estimate from published specifications,
-not a test result. `Pro` is not a cosmetic suffix: the Pro towers are Ivy
-Bridge, the non-Pro models of the same number are an older Sandy Bridge
-platform. See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
-
-**This version has not yet been run on real TS-x70 hardware.** It is a rewrite
-of code that was; the protocol and register behaviour it relies on were
-observed on the reference TS-470 Pro, but this implementation — including the
-installer's migration, rollback and diagnostic paths — has so far only been
-validated offline, by tests and against simulated devices and a fake root.
-Treat the first install as the first hardware test — and read
-[docs/LCD_GUIDE.md](docs/LCD_GUIDE.md) first, because it writes to a serial
-port and, with fan control enabled, to your fan controller.
-
----
-
 ## What you get
 
-**LCD monitor** (`qnap-tsx70-lcd`) — the stable part.
+**LCD monitor** (`qnap-tsx70-lcd`) — installed by default.
 Rotates through seven pages on the 2×16 front panel: hostname and IP, CPU
 temperature and load, uptime and disk count, CPU utilisation and clock, fan
 RPM, network throughput, and board and NIC temperatures. The ENTER and SELECT
@@ -49,7 +20,25 @@ Drives the chassis fan from CPU temperature. Its calibration step deliberately
 stops the fan to find its limits. You do not need it to use the LCD. Read
 [docs/FAN_CONTROL.md](docs/FAN_CONTROL.md) first.
 
----
+## Compatibility and validation status
+
+| Scope | Status |
+|---|---|
+| Reference hardware | QNAP **TS-470 Pro**, Ubuntu 24.04 LTS, kernel 7.0 series; hardware behaviour observed with the earlier implementation |
+| Current implementation | Offline tests and simulated devices only; **not yet validated on physical TS-x70 hardware** |
+| Other tower models | TS-670 Pro, TS-870 Pro, TS-470 / TS-670 / TS-870 (non-Pro): **unverified** |
+| TS-470U-RP | LCD support **unlikely** — QNAP's product page does not list an LCD |
+
+Hardware observations are not acceptance tests of the current software. The
+LCD, installer, migration, rollback and diagnostics still need validation on a
+physical unit; fan control remains experimental.
+
+`Pro` and non-`Pro` models may differ in CPU generation, board and controller.
+See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the evidence and the
+reference configuration.
+
+Read [docs/LCD_GUIDE.md](docs/LCD_GUIDE.md) before installing. The LCD writes to
+a serial port as root; optional fan control writes to the fan controller.
 
 ## Quick start (LCD only)
 
@@ -94,11 +83,10 @@ The full walkthrough, including what to do when nothing appears, is in
 sudo ./scripts/install.sh --with-fan-control
 ```
 
-This installs the service but does **not** start it, because it needs a
-calibration run that stops your fan — and it does not enable it either unless
-a valid calibration is already there, because an enabled fan service with no
-calibration just fails at every boot. Calibrate first, then
-`sudo systemctl enable --now qnap-tsx70-fancontrol`. See
+On a first install, the fan service is left stopped and is not enabled without
+a valid calibration. Calibration deliberately stops the fan. Calibrate first,
+then use `sudo systemctl enable --now qnap-tsx70-fancontrol`. An upgrade can
+restart a previously running, calibrated fan service. See
 [docs/FAN_CONTROL.md](docs/FAN_CONTROL.md).
 
 ### Removing it
@@ -108,47 +96,30 @@ sudo ./scripts/uninstall.sh            # keeps your config and calibration
 sudo ./scripts/uninstall.sh --purge    # removes those too
 ```
 
----
-
-## Upgrading from the old `saturn-*` names
-
-Version 2.0.0 renamed every binary, unit and path. The installer detects a
-legacy installation, backs it up, migrates it and rolls back if anything fails.
-Run `sudo ./scripts/install.sh` and read
-[docs/MIGRATION_FROM_SATURN.md](docs/MIGRATION_FROM_SATURN.md).
-
----
-
 ## The reference hardware
 
-The machine this is tested on is a TS-470 Pro that has been **modified**: it
-runs an Intel Core i7-3770T in place of the stock Core i3-3220, has 16 GiB of
-DDR3-1600 SO-DIMM fitted, boots from a SATA SSD, and carries an add-in 2.5 GbE
-NIC alongside the two stock Intel gigabit ports.
+The hardware observations come from a **modified TS-470 Pro**: an Intel Core
+i7-3770T replaces the stock Core i3-3220, 16 GiB of DDR3-1600 SO-DIMM is fitted,
+Linux boots from a SATA SSD, and an add-in 2.5 GbE NIC complements the two stock
+Intel gigabit ports.
 
-The CPU swap is not required by anything here, and it is not a recommendation.
-The `T` part is a 45 W chip, below the stock 55 W, which is the right direction
-for a chassis built around a single 9 cm fan — fitting something hotter is a
-thermal problem, not an upgrade.
+These upgrades are not required by this project. The CPU swap is not a
+recommendation: check CPU power requirements against the chassis cooling
+before considering a replacement.
 
-The full inventory, the stock specification it is being compared against, and
-the sources for both are in
+The recorded inventory, stock specifications and sources are in
 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#3-the-tested-reference-machine).
-
----
 
 ## Documentation
 
 | Document | What it covers |
 |---|---|
-| [LCD_GUIDE.md](docs/LCD_GUIDE.md) | Complete install-to-uninstall guide: preflight, reversible protocol test, install, configuration, daily use, systemd, troubleshooting by symptom, rollback |
-| [LCD_PROTOCOL.md](docs/LCD_PROTOCOL.md) | ICP A125 wire protocol: command bytes, framing, timing, button frames, verified vs inferred |
-| [FAN_CONTROL.md](docs/FAN_CONTROL.md) | Experimental fan control: hazards, safety model, commands, limitations |
-| [COMPATIBILITY.md](docs/COMPATIBILITY.md) | Per-model and per-feature evidence, reference hardware, how to contribute a report |
-| [MIGRATION_FROM_SATURN.md](docs/MIGRATION_FROM_SATURN.md) | Upgrading from the legacy `saturn-*` layout |
-| [CHANGELOG.md](CHANGELOG.md) | Release history |
-
----
+| [LCD guide](docs/LCD_GUIDE.md) | Hardware checks, installation, configuration, daily use, troubleshooting and removal |
+| [LCD protocol](docs/LCD_PROTOCOL.md) | ICP A125 commands, framing, timing, buttons and evidence limits |
+| [Fan control](docs/FAN_CONTROL.md) | Experimental feature: hazards, safety model, calibration and limitations |
+| [Compatibility](docs/COMPATIBILITY.md) | Per-model evidence, reference hardware and compatibility reports |
+| [Legacy migration](docs/MIGRATION_FROM_SATURN.md) | For existing installations using the old `saturn-*` layout; backup, migration and rollback |
+| [Changelog](CHANGELOG.md) | Version history and user-visible changes |
 
 ## Repository layout
 
@@ -161,8 +132,6 @@ docs/       guides and references
 tests/      offline test suite, no hardware required
 ```
 
----
-
 ## Requirements
 
 - A QNAP TS-x70 with the ICP A125-compatible front panel
@@ -171,27 +140,24 @@ tests/      offline test suite, no hardware required
   degrades to `N/A` without them
 - root, for the serial port and for SMART
 
----
-
 ## Reporting a problem
 
 ```bash
 sudo ./scripts/diagnose.sh -o bundle.txt
 ```
 
-The bundle is redacted — hostnames, IP and MAC addresses, UUIDs and disk serial
-numbers are replaced with placeholders — but read it before posting it.
+The bundle redacts hostnames, IP and MAC addresses, UUIDs and disk serial
+numbers, but **review it before posting**. Redaction is not a guarantee that
+all identifying information has been removed.
 
-Reports from models other than the TS-470 Pro are especially welcome, including
-negative ones. See
+Reports testing the current software on a TS-470 Pro or another model are
+welcome, including negative results. See
 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#5-contributing-a-report).
-
----
 
 ## Acknowledgements
 
-The protocol work builds on several community projects that reverse-engineered
-QNAP front panels and embedded controllers; they are credited with links in
+The protocol work builds on community projects that reverse-engineered QNAP
+front panels and embedded controllers. They are credited in
 [docs/LCD_PROTOCOL.md](docs/LCD_PROTOCOL.md#7-references).
 
 ## License

@@ -12,7 +12,8 @@ permissions:
 jobs:
   python:
     name: Python compile and tests
-    runs-on: ubuntu-latest
+    # Python 3.9 x64 builds are available for 24.04, not the newer latest image.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
