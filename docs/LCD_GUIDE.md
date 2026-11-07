@@ -138,7 +138,7 @@ sudo ./scripts/install.sh --dry-run
 | Requirement | Notes |
 |---|---|
 | A QNAP TS-x70 with the front LCD | Reference hardware: TS-470 Pro with the earlier implementation. Current software needs hardware validation; other models are unverified. |
-| Linux with systemd | Reference observations: Ubuntu 24.04 LTS; not hardware acceptance of the current software |
+| Linux with systemd | Reference host snapshot: Ubuntu 24.04.5 LTS, kernel 7.0.0-42-generic, 2026-11-06; not hardware acceptance of the current software. See [compatibility](COMPATIBILITY.md#latest-software-snapshot). |
 | Python 3.9 or newer | Standard library only, no pip packages |
 | `root` / `sudo` | Needed for the serial port and for SMART |
 | `smartmontools` | Optional — disk pages show `N/A` without it |

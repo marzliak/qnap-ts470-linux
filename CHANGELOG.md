@@ -84,6 +84,9 @@ hardware. See [compatibility](docs/COMPATIBILITY.md).
 
 ### Documentation
 
+- Updated the reference host's OS/kernel snapshot to Ubuntu 24.04.5 LTS and
+  7.0.0-42-generic, observed on 2026-11-06. Historical hardware measurements
+  remain dated separately; the current package's validation status is unchanged.
 - The README leads with capabilities and installation. Legacy migration
   remains linked as a guide for existing users rather than a standalone
   feature section.

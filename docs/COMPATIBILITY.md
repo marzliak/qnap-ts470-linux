@@ -61,9 +61,24 @@ as unlikely until somebody demonstrates otherwise.
 
 ## 3. The tested reference machine
 
-The configuration below records the reference TS-470 Pro observed on
-**2026-09-12**. It is a hardware reference, not a current inventory or a set of
-minimum requirements.
+The hardware inventory and sensor measurements below record the reference
+TS-470 Pro observed on **2026-09-12**. They are historical observations, not a
+current inventory or a set of minimum requirements. The newer OS/kernel
+snapshot is recorded separately.
+
+### Latest software snapshot
+
+Read-only observation on **2026-11-06 at 23:59 UTC**:
+
+| Item | Running on the reference unit |
+|---|---|
+| OS | **Ubuntu 24.04.5 LTS** (`noble`, version ID `24.04`) |
+| Kernel | **7.0.0-42-generic** |
+| Architecture | x86_64 |
+
+These are the running OS/kernel versions, not a new feature test or hardware
+acceptance of the current package. The inventory and sensor readings below
+retain their original observation date and versions.
 
 ### As shipped by QNAP
 
@@ -150,7 +165,7 @@ unit could expose a different but driver-compatible variant.
 
 | Distribution | Status |
 |---|---|
-| Ubuntu 24.04 LTS | Reference hardware observed with the earlier implementation; current software validated offline only |
+| Ubuntu 24.04 LTS | Reference host observed running 24.04.5 LTS with kernel 7.0.0-42-generic on 2026-11-06; current repository implementation validated offline only |
 | Other systemd-based distributions | Unverified - the requirements are Python 3.9+, systemd, and optionally `smartmontools` and `util-linux` |
 | Non-systemd init | Unverified - the binaries do not depend on systemd, but the units and installer do |
 | QTS (QNAP's own firmware) | Out of scope |

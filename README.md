@@ -24,7 +24,8 @@ stops the fan to find its limits. You do not need it to use the LCD. Read
 
 | Scope | Status |
 |---|---|
-| Reference hardware | QNAP **TS-470 Pro**, Ubuntu 24.04 LTS, kernel 7.0 series; hardware behaviour observed with the earlier implementation |
+| Reference hardware | QNAP **TS-470 Pro**; hardware behaviour observed with the earlier implementation on 2026-09-12 |
+| Latest host snapshot — 2026-11-06 | **Ubuntu 24.04.5 LTS**, kernel **7.0.0-42-generic**, x86_64; running OS/kernel checked on the reference unit |
 | Current implementation | Offline tests and simulated devices only; **not yet validated on physical TS-x70 hardware** |
 | Other tower models | TS-670 Pro, TS-870 Pro, TS-470 / TS-670 / TS-870 (non-Pro): **unverified** |
 | TS-470U-RP | LCD support **unlikely** — QNAP's product page does not list an LCD |
@@ -35,7 +36,8 @@ physical unit; fan control remains experimental.
 
 `Pro` and non-`Pro` models may differ in CPU generation, board and controller.
 See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the evidence and the
-reference configuration.
+reference configuration, including the dated
+[software snapshot](docs/COMPATIBILITY.md#latest-software-snapshot).
 
 Read [docs/LCD_GUIDE.md](docs/LCD_GUIDE.md) before installing. The LCD writes to
 a serial port as root; optional fan control writes to the fan controller.
