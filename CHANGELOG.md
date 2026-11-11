@@ -55,7 +55,15 @@ hardware. See [compatibility](docs/COMPATIBILITY.md).
 
 ### Fixed — fan control
 
-- Manual-mode and duty writes require exact register readback. Calibration
+- Recovery no longer attempts duty writes on channels already in automatic
+  mode, where the real driver returns `EROFS`. Manual channels retain the
+  full-duty attempt before automatic handback.
+- Duty acknowledgement accepts the exact documented RPM-target round trip
+  with an unchanged valid full-speed scale, not an arbitrary tolerance.
+- Recovery logs distinguish driver acknowledgement from physical effect;
+  cached sysfs values do not independently verify fan actuation.
+- Read-only status preserves unknown RPM and includes `full_speed_rpm`.
+- Manual-mode and duty writes require documented driver readback. Calibration
   aborts on a refused write, unreadable register or mismatched value before
   advancing the sweep.
 - Consecutive write failures are tracked independently per channel and
@@ -84,6 +92,9 @@ hardware. See [compatibility](docs/COMPATIBILITY.md).
 
 ### Documentation
 
+- Added exact-model official-QTS firmware findings for issue #1: Fintek
+  F71869A/SIO route, channel 2 mapping, the contradictory later channel 3
+  observation, Linux ABI limits and the remaining physical acceptance gate.
 - Updated the reference host's OS/kernel snapshot to Ubuntu 24.04.5 LTS and
   7.0.0-42-generic, observed on 2026-11-06. Historical hardware measurements
   remain dated separately; the current package's validation status is unchanged.

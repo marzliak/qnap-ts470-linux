@@ -22,9 +22,9 @@ write and keeps its contents, and `ignore_when` is the same thing aimed at one
 step of a sweep. The reads go to the real file throughout, so what these tests
 exercise is the program's own readback and nothing about the harness.
 
-The rule under test is exact equality. A duty of 100 that reads back as 99 is
-a failure here, deliberately: there is no documented quantization in this
-driver, and a tolerance would forgive the chip this is aimed at.
+Without a valid full-speed scale the rule is exact equality. The documented
+RPM-target conversion has separate coverage in test_fan_driver_abi; it does
+not authorize a generic tolerance or prove physical actuation.
 """
 
 import contextlib
@@ -162,8 +162,7 @@ class CommitWriteTests(unittest.TestCase):
         self.assertIn("reads back as nothing", out.getvalue())
 
     def test_the_comparison_is_exact_and_not_a_tolerance(self):
-        # One off is a failure. There is no documented quantization in this
-        # driver, so a near miss is a chip doing something unexplained.
+        # A near miss without a valid RPM full-speed scale is unexplained.
         def off_by_one(path, value):
             with open(path, "w", encoding="ascii") as fh:
                 fh.write("%d\n" % (int(value) - 1))
@@ -291,7 +290,7 @@ class CalibrationModeReadbackTests(CalibrationReadbackCase):
             ignore_when=nth_write("pwm3_enable", fan.PWM_MANUAL))
 
         self.assertEqual(code, 1, printed)
-        self.assertEqual(self.duties(written), [fan.SAFE_PWM],
+        self.assertEqual(self.duties(written), [],
                          "a duty was commanded on a channel this program does "
                          "not own: %s" % written)
 
