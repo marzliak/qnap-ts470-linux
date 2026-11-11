@@ -4,9 +4,12 @@ Hardware behaviour was observed on **one reference TS-470 Pro** with the
 earlier implementation. Other models are estimates based on published
 specifications, not confirmed compatibility.
 
-**The current implementation has been validated offline only, not on physical
-TS-x70 hardware.** The feature matrix records earlier hardware observations;
-it does not establish acceptance of the current binaries or installer.
+**Current fan-only acceptance was completed on the reference TS-470 Pro on
+2026-11-10:** speed response, automatic handback and service stop/start passed.
+The rewritten LCD, generic installer and hazardous calibration remain
+unverified on hardware. See the
+[physical fan results](FAN_FIRMWARE_FINDINGS.md#physical-acceptance-on-2026-11-10);
+earlier feature observations below remain separately dated.
 
 ## How to read the status column
 
@@ -25,7 +28,7 @@ capability; it is not a compatibility guarantee.
 
 | Model | LCD write | Buttons | Sensors | SMART | Fan control | Basis |
 |---|---|---|---|---|---|---|
-| **TS-470 Pro** | Tested | Tested | Tested | Tested | Single-machine evidence | Reference unit, Ubuntu 24.04 LTS, kernel 7.0 series, 2026-09-12 |
+| **TS-470 Pro** | Tested | Tested | Tested | Tested | Current fan runtime accepted on one unit | Reference unit: earlier features 2026-09-12; fan-only acceptance 2026-11-10, Ubuntu 24.04.5 LTS / 7.0.0-42-generic |
 | TS-670 Pro | Unverified | Unverified | Unverified | Unverified | Unverified | Same tower family and same CPU generation as the reference unit |
 | TS-870 Pro | Unverified | Unverified | Unverified | Unverified | Unverified | Same tower family and same CPU generation as the reference unit |
 | TS-470 (non-Pro) | Unverified | Unverified | Unverified | Unverified | Unverified | Different CPU generation — see section 2 |

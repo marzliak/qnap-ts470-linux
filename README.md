@@ -20,7 +20,9 @@ Drives the chassis fan from CPU temperature. Its calibration step deliberately
 stops the fan to find its limits. You do not need it to use the LCD. Read
 [docs/FAN_CONTROL.md](docs/FAN_CONTROL.md) first. The
 [official-firmware findings](docs/FAN_FIRMWARE_FINDINGS.md) identify QTS's
-Fintek control route; physical acceptance of this package remains pending.
+Fintek control route. Fan-only deployment, speed response and automatic handback
+were validated on the reference TS-470 Pro on 2026-11-10; calibration remains
+unverified for this implementation.
 
 ## Compatibility and validation status
 
@@ -28,13 +30,15 @@ Fintek control route; physical acceptance of this package remains pending.
 |---|---|
 | Reference hardware | QNAP **TS-470 Pro**; hardware behaviour observed with the earlier implementation on 2026-09-12 |
 | Latest host snapshot — 2026-11-06 | **Ubuntu 24.04.5 LTS**, kernel **7.0.0-42-generic**, x86_64; running OS/kernel checked on the reference unit |
-| Current implementation | Offline tests and simulated devices only; **not yet validated on physical TS-x70 hardware** |
+| Current fan implementation — 2026-11-10 | Installed and exercised on the reference TS-470 Pro: channel 3 speed response, automatic handback and service stop/start; no stall calibration |
+| Current LCD/installer implementation | Offline tests and simulated devices only; current rewritten LCD and generic installer not hardware-accepted |
 | Other tower models | TS-670 Pro, TS-870 Pro, TS-470 / TS-670 / TS-870 (non-Pro): **unverified** |
 | TS-470U-RP | LCD support **unlikely** — QNAP's product page does not list an LCD |
 
-Hardware observations are not acceptance tests of the current software. The
-LCD, installer, migration, rollback and diagnostics still need validation on a
-physical unit; fan control remains experimental.
+The dated fan-only acceptance does not validate the rewritten LCD, generic
+installer/migration/rollback or hazardous calibration. Fan control remains
+experimental and CPU-temperature-only; see the
+[bounded physical results](docs/FAN_FIRMWARE_FINDINGS.md#physical-acceptance-on-2026-11-10).
 
 `Pro` and non-`Pro` models may differ in CPU generation, board and controller.
 See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the evidence and the
