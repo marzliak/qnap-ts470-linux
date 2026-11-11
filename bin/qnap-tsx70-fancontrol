@@ -25,9 +25,9 @@ Safety model (docs/FAN_CONTROL.md has the full discussion):
     emergency recovery;
   * SIGTERM, SIGINT, SIGHUP and SIGQUIT are all handled before the first
     register write, so an SSH disconnect mid-calibration still fails safe;
-  * every exit path - clean, signalled or crashed - forces full duty and hands
-    the channels back to automatic mode, then reads the registers back to
-    confirm it actually happened. That readback decides the exit status: a
+  * every exit path requests automatic handback; channels not already in
+    automatic receive a full-duty attempt first. Driver readback acknowledges
+    software state but does not independently prove physical effect. That readback decides the exit status: a
     stop that cannot prove the chip took the fans back exits nonzero instead
     of reporting a clean shutdown. `safe-state --dry-run` writes nothing and
     reads nothing back, so it exits 3 - "previewed, not proven" - and never
@@ -41,8 +41,8 @@ Safety model (docs/FAN_CONTROL.md has the full discussion):
     may sit stopped, and treats every one of its own control writes as a hard
     gate: a duty the chip did not acknowledge aborts the sweep instead of
     being followed by a lower one;
-  * a mode or duty write is only believed once the register reads back as
-    exactly the value that was asked for. A sysfs write returning success says
+  * mode readback must be exact; duty readback must match its documented
+    direct or integer RPM-target representation. A sysfs write returning success says
     the driver took the bytes and nothing about what the chip did with them,
     and the one failure that looks like everything working is the register
     that answers every command and keeps its old contents. An unverified
@@ -277,6 +277,28 @@ def validate_cache(data):
         }
     return {"channels": sorted(set(channels)), "fans": fans,
             "version": data.get("version", 1)}
+
+
+def rpm_target_readback(duty, full_speed):
+    """Exact f71882fg RPM-mode round trip, not a +/- duty tolerance.
+
+    store_pwm converts a 0..255 fraction into a 16-bit tachometer target;
+    show_pwm converts it back with integer division. PWM mode is exact.
+    The ABI does not expose which of these two modes BIOS selected, so a
+    readback can acknowledge either documented representation. Neither proves
+    physical actuation: the kernel caches these values after writing them.
+    Reject unusable scales and overflows instead of modelling wrapped values.
+    """
+    if (type(full_speed) is not int or not 0 < full_speed <= 1500000
+            or type(duty) is not int or not 0 <= duty <= PWM_MAX):
+        return None
+    target_rpm = duty * full_speed // PWM_MAX
+    if not target_rpm:
+        return 0 if duty == 0 else None
+    target_reg = 1500000 // target_rpm
+    if not 0 < target_reg <= 65535:
+        return None
+    return PWM_MAX * (1500000 // target_reg) // full_speed
 
 
 def calibration_is_degenerate(result):
@@ -613,7 +635,7 @@ class FanController:
                       for (channel, register), count
                       in self._write_failures.items() if count >= limit)
 
-    def _commit_write(self, channel, register, expected, wrote):
+    def _commit_write(self, channel, register, expected, wrote, rpm_full_speed=None):
         """Record one register write, believing the readback and not the write.
 
         A sysfs write that returns success has proven that the driver took the
@@ -631,17 +653,22 @@ class FanController:
         makes one permanently ignored register reach WRITE_FAILURE_LIMIT on
         its own while every other channel keeps answering: see _record_write.
 
-        The comparison is exact. Nothing in this driver's behaviour says a
-        written duty comes back rounded or quantized, and a tolerance invented
-        here would forgive precisely the chip this exists to catch. If
-        evidence for quantization ever turns up, it belongs in the protocol
-        documentation first and in a named constant second - not in a
-        `abs(a - b) <= n` nobody can date.
+        Mode values remain exact. Duty may also match the documented integer
+        RPM-target conversion, but only with an unchanged valid full-speed
+        scale sampled before the write. No generic tolerance is accepted.
+        This acknowledges the sysfs ABI, not the physical fan: f71882fg can
+        answer from its software cache rather than rereading the chip.
         """
         if not wrote:
             return self._record_write(channel, register, False)
         actual = read_int(self._path(register))
         if actual == expected:
+            return self._record_write(channel, register, True)
+        if (register == "pwm%d" % channel
+                and rpm_full_speed is not None
+                and read_int(self._path("fan%d_full_speed" % channel)) == rpm_full_speed
+                and actual is not None
+                and actual == rpm_target_readback(expected, rpm_full_speed)):
             return self._record_write(channel, register, True)
         log("ALERT channel %d: %s took the write and did not take the value - "
             "asked for %s, reads back as %s. Counted as a failed write."
@@ -677,8 +704,8 @@ class FanController:
     def set_pwm(self, channel, value):
         """Command one duty, and prove the register took it.
 
-        True only when `pwmN` reads back as exactly the clamped value that was
-        asked for. The clamp is applied before the comparison for the same
+        True when the driver reports the clamped value or its documented
+        RPM-mode round trip. The clamp is applied before comparison for the same
         reason it is applied before the write: 9999 is a command for 255, and
         255 is what the register is then required to hold.
         """
@@ -687,9 +714,10 @@ class FanController:
             return True
         register = "pwm%d" % channel
         target = clamp_pwm(value)
+        full_speed = read_int(self._path("fan%d_full_speed" % channel))
         return self._commit_write(
             channel, register, target,
-            write_sysfs(self._path(register), target))
+            write_sysfs(self._path(register), target), rpm_full_speed=full_speed)
 
     def restore(self, channel):
         """Return one channel to exactly the state observed before this run.
@@ -708,7 +736,9 @@ class FanController:
             return True
         wrote_duty = True
         target = original.get("pwm")
-        if target is not None:
+        if (target is not None and not
+                (original.get("enable") == PWM_AUTOMATIC
+                 and self.enable_mode(channel) == PWM_AUTOMATIC)):
             wrote_duty = write_sysfs(self._path("pwm%d" % channel),
                                      clamp_pwm(target))
             if original.get("enable") == PWM_MANUAL and clamp_pwm(target) < PWM_FLOOR:
@@ -733,7 +763,9 @@ class FanController:
         return sorted(self._original)
 
     def _restore_one(self, channel):
-        """Put one channel back and prove it. True only when proven.
+        """Request automatic mode and check driver acknowledgement.
+
+        Cached sysfs readback does not independently prove physical effect.
 
         The proof is the `pwmN_enable` readback, and it has to be exactly
         PWM_AUTOMATIC. "Unreadable" is not a pass: this used to accept None
@@ -745,7 +777,13 @@ class FanController:
         happens to say automatic. The two answers come from the same register
         interface: if it is refusing writes, its reads are not evidence either.
         """
-        wrote_duty = write_sysfs(self._path("pwm%d" % channel), SAFE_PWM)
+        # The real driver rejects pwmN writes with EROFS while automatic.
+        # Do not switch an automatic channel to manual merely for cleanup.
+        # Manual/unknown channels still receive full duty before handback;
+        # attempt the mode write even if that protective write fails.
+        already_auto = self.enable_mode(channel) == PWM_AUTOMATIC
+        wrote_duty = (already_auto or
+                      write_sysfs(self._path("pwm%d" % channel), SAFE_PWM))
         wrote_mode = write_sysfs(self._path("pwm%d_enable" % channel),
                                  PWM_AUTOMATIC)
         mode = self.enable_mode(channel)
@@ -763,7 +801,8 @@ class FanController:
                    "unreadable" if mode is None else "still in mode %d" % mode,
                    PWM_AUTOMATIC))
             return False
-        log("  channel %d -> automatic mode (verified)" % channel)
+        log("  channel %d -> automatic mode (verified via driver; "
+            "physical effect untested)" % channel)
         return True
 
     @staticmethod
@@ -799,10 +838,10 @@ class FanController:
         return deferred
 
     def safe_state(self, channels=None, reason=""):
-        """Force touched channels to full duty and chip-managed automatic mode.
+        """Hand channels to automatic mode; request full duty unless already auto.
 
-        Returns True only when every target channel was proven to be back in
-        automatic mode. No target at all is False, not a vacuous success: the
+        Returns True only when the driver acknowledges every target in
+        automatic mode; cached values do not prove physical recovery. No target at all is False, not a vacuous success: the
         caller asked for a fan to be handed back and none was.
 
         Called from `finally` blocks and after signals, so it must never raise
@@ -1014,7 +1053,8 @@ def cmd_status(args):
         controller = FanController(device)
         for channel in controller.channels():
             report["channels"][str(channel)] = {
-                "rpm": controller.rpm(channel),
+                "rpm": read_int(controller._path("fan%d_input" % channel)),
+                "full_speed_rpm": read_int(controller._path("fan%d_full_speed" % channel)),
                 "pwm": controller.pwm(channel),
                 "enable": controller.enable_mode(channel),
                 "controllable": controller.controllable(channel),
@@ -1038,9 +1078,9 @@ def cmd_status(args):
         log("channels   :")
         for channel, data in sorted(report["channels"].items(),
                                     key=lambda kv: natural_key(kv[0])):
-            log("  fan%s  %5s RPM  pwm=%-4s enable=%-4s controllable=%s"
+            log("  fan%s  %5s RPM  pwm=%-4s enable=%-4s controllable=%s full_speed_rpm=%s"
                 % (channel, data["rpm"], data["pwm"], data["enable"],
-                   data["controllable"]))
+                   data["controllable"], data["full_speed_rpm"]))
         log("active     : %s" % (report.get("active_channels") or "none"))
     cache = report.get("cache")
     if cache:
@@ -1102,7 +1142,8 @@ def cmd_safe_state(args):
     if not controller.safe_state(channels, reason="requested via safe-state"):
         log("ERROR automatic fan mode could not be verified on %s" % device)
         return 1
-    log("automatic fan mode verified on channels %s" % channels)
+    log("automatic fan mode verified on channels %s via driver; "
+        "physical effect untested" % channels)
     return finish_or_stop(controller, 0)
 
 

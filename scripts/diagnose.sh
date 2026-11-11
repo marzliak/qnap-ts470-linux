@@ -163,10 +163,11 @@ collect() {
         local ch
         for ch in 1 2 3 4; do
             [ -r "$dev/fan${ch}_input" ] || continue
-            printf '  fan%s rpm=%-6s pwm=%-5s enable=%s\n' "$ch" \
+            printf '  fan%s rpm=%-6s pwm=%-5s enable=%s full_speed_rpm=%s\n' "$ch" \
                 "$(cat "$dev/fan${ch}_input" 2>/dev/null)" \
                 "$(cat "$dev/pwm${ch}" 2>/dev/null || echo n/a)" \
-                "$(cat "$dev/pwm${ch}_enable" 2>/dev/null || echo n/a)"
+                "$(cat "$dev/pwm${ch}_enable" 2>/dev/null || echo n/a)" \
+                "$(cat "$dev/fan${ch}_full_speed" 2>/dev/null || echo n/a)"
         done
     done
     [ "$found" -eq 0 ] && printf 'no f71882fg platform device found\n'

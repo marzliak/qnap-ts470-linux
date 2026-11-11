@@ -212,7 +212,7 @@ class SafeStateVerificationTests(unittest.TestCase):
         with quiet() as out, registers(ignore=["pwm2_enable"]):
             self.assertFalse(controller.safe_state([1, 2], reason="test"))
         printed = out.getvalue()
-        self.assertIn("channel 1 -> automatic mode (verified)", printed)
+        self.assertIn("channel 1 -> automatic mode (verified via driver;", printed)
         self.assertIn("channel 2 is still in mode 1", printed)
 
 
@@ -574,9 +574,9 @@ class CalibrationWriteGateTests(CalibrationCase):
         self.assertEqual(code, 1, printed)
         self.assertIn("channel 3 is not in manual mode", printed)
         self.assertFalse(os.path.exists(self.cache))
-        # Nothing was measured, so no duty was ever commanded. The safe state
-        # writes full duty on the way out; that is the only pwm3 write here.
-        self.assertEqual(self.duties(written), [fan.SAFE_PWM],
+        # No measurement: the chip remains automatic. Cleanup must not write
+        # duty in this mode, because the real driver rejects that write.
+        self.assertEqual(self.duties(written), [],
                          "a duty was commanded on a chip that never took the "
                          "manual-mode command: %s" % written)
 
@@ -585,8 +585,7 @@ class CalibrationWriteGateTests(CalibrationCase):
             fail_when=nth_write("pwm3_enable", fan.PWM_MANUAL))
 
         self.assertEqual(code, 1)
-        self.assertEqual(written[-2:], [("pwm3", fan.SAFE_PWM),
-                                        ("pwm3_enable", fan.PWM_AUTOMATIC)],
+        self.assertEqual(written[-1:], [("pwm3_enable", fan.PWM_AUTOMATIC)],
                          "the abort did not end in a safe state: %s" % written)
 
     # -- spin-up -------------------------------------------------------------

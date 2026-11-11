@@ -18,7 +18,9 @@ buttons open per-disk SMART detail. Three SELECT presses toggle the backlight.
 installed by default.**
 Drives the chassis fan from CPU temperature. Its calibration step deliberately
 stops the fan to find its limits. You do not need it to use the LCD. Read
-[docs/FAN_CONTROL.md](docs/FAN_CONTROL.md) first.
+[docs/FAN_CONTROL.md](docs/FAN_CONTROL.md) first. The
+[official-firmware findings](docs/FAN_FIRMWARE_FINDINGS.md) identify QTS's
+Fintek control route; physical acceptance of this package remains pending.
 
 ## Compatibility and validation status
 

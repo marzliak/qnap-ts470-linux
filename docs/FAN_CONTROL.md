@@ -17,10 +17,14 @@
 Super-I/O monitoring chip that the mainline `f71882fg` driver exposes on
 MAHOBAY-based QNAP boards.
 
-It exists because the standard `fancontrol` package does not work on this
-hardware: `f71882fg` publishes its `pwm*` attributes under the platform device
-(`/sys/devices/platform/f71882fg.<addr>/`) rather than under
-`/sys/class/hwmon/hwmonN/`, which is where `fancontrol` looks.
+It accesses the driver directly through its platform-device attributes
+(`/sys/devices/platform/f71882fg.<addr>/`). Earlier deployments encountered
+path/configuration problems with the standard `fancontrol` package; that is
+not a hardware limitation or proof that the package cannot use these paths.
+
+The [official-firmware investigation](FAN_FIRMWARE_FINDINGS.md) identifies the
+F71869A/SIO route used by QTS and explains the unresolved channel-number
+difference. The IT8528E suggestion in issue #1 is not an established diagnosis.
 
 ### Status by claim
 
@@ -38,8 +42,9 @@ only been exercised offline.
 | Safe for unattended use | **Not claimed** |
 
 The offline validation is real and reproducible — interrupting a simulated
-calibration with `SIGTERM`, `SIGINT`, `SIGHUP` or `SIGQUIT` leaves every
-channel at full duty in automatic mode, and a dead tachometer makes the loop
+calibration with `SIGTERM`, `SIGINT`, `SIGHUP` or `SIGQUIT` requests
+automatic handback (and full duty first unless already automatic); a dead
+tachometer makes the loop
 escalate, give up and exit nonzero. What it cannot tell you is how *your* fan
 behaves when the duty actually drops.
 
@@ -79,19 +84,30 @@ The `f71882fg` driver exposes, per channel `N`:
 | Attribute | Meaning |
 |---|---|
 | `fanN_input` | measured speed in RPM |
-| `pwmN` | commanded duty, 0–255 |
+| `pwmN` | 0–255 direct PWM or fraction of full-speed RPM, selected by BIOS |
 | `pwmN_enable` | control mode |
 
 `pwmN_enable` values used here:
 
 | Value | Meaning | Status |
 |---|---|---|
-| `1` | manual — `pwmN` is obeyed directly | Verified on the reference unit |
+| `1` | manual — `pwmN` sets direct PWM or a target-RPM fraction | Earlier reference observation; see ABI limits below |
 | `2` | automatic — the chip controls the fan from its own temperature input | Verified on the reference unit |
 
 These match the mode numbering documented for the driver in the kernel tree
 ([`Documentation/hwmon/f71882fg.rst`](https://www.kernel.org/doc/html/latest/hwmon/f71882fg.html)).
 Mode numbering above `2` is **not** used by this project.
+
+In RPM mode the driver converts the target through integer divisions, so an
+acknowledged command can read back rounded (for example 100 → 99 with a
+1500 RPM full-speed scale). Only that exact documented conversion is accepted,
+with a valid unchanged scale; there is no generic tolerance. `status` reports
+`full_speed_rpm` to aid diagnosis. Unreadable RPM is `null`, not zero.
+
+**Readback means driver acknowledgement, not independent hardware proof.**
+The driver caches values after writes, so immediate sysfs reads cannot prove
+physical fan response. All hardware-effect and automatic-fallback limitations
+still apply; see [the investigation](FAN_FIRMWARE_FINDINGS.md).
 
 ### Channel numbering is not portable
 
@@ -246,12 +262,15 @@ legacy cache.
 sudo qnap-tsx70-fancontrol safe-state
 ```
 
-Forces every controllable channel to full duty and then back to the chip's
-automatic mode. Run this if anything ever leaves your fan in a state you do not
-like. It is also wired as `ExecStopPost=` on the service, so a `SIGKILL` or an
-OOM kill still ends with the chip in charge.
+For each controllable channel not already in automatic mode, attempts full
+duty and then automatic handback. Channels already in automatic mode receive
+only the automatic-mode command: the driver rejects duty writes in that mode.
+Run this if anything leaves the fan in an unexpected state. It is also wired
+as `ExecStopPost=` so systemd attempts recovery after a `SIGKILL` or OOM kill;
+that attempt and its cached driver readback do not prove physical recovery.
 
-**The exit status is a verdict, not a receipt.** It is 0 only when every
+**The exit status is a driver-interface verdict, not physical proof.** It is
+0 only when every
 controllable channel was written *and* read back as `pwmN_enable = 2`. A write
 the chip refused, a register that will not answer, a channel still in manual
 mode, or a chip with no controllable channel at all each exit nonzero and say
@@ -261,7 +280,7 @@ scripts may do the same.
 
 | Exit | Meaning |
 |---|---|
-| 0 | every controllable channel was written and read back as automatic mode. This, and only this, is a verified handback |
+| 0 | every target accepted the required writes and the driver reports automatic mode; physical effect is not independently verified |
 | 1 | it could not be proven: a refused write, an unreadable register, a channel still in manual mode, no controllable channel, or no controller at all |
 | 2 | usage error from the command line |
 | 3 | `--dry-run`: nothing was written, nothing was read back, nothing was proven |
@@ -355,13 +374,13 @@ stops, then raises it again until it starts. During that window the machine has
 | Thermal abort | Aborts and fails safe at 70 °C during the sweep |
 | Lost telemetry | Every settle sample is validated; a missing, unparseable, NaN, infinite or out-of-band reading aborts the sweep immediately, before the duty is lowered again |
 | Refused control write | Every control write is a gate: manual mode, the spin-up, each step of the descent, the zero duty, each step of the restart search, the measured minimum and the cool-down. The first one the chip does not acknowledge aborts the sweep, because the next step is always *lower* and taking it would be stepping the fan towards its stall point without knowing what duty it is on. Nothing is analysed and nothing is saved |
-| Ignored control write | A write that returns success proves the driver took the bytes and nothing about what the chip did with them. Every mode and duty write is read back and must equal exactly the value asked for; a mismatch, or a register that will not read at all, is counted as a failed write on that channel and register. In a sweep that aborts it before the next, lower command; in the control loop it reaches the same three-strike threshold, so one permanently ignored register fails safe while every other channel keeps answering |
+| Ignored control write | A write that returns success proves the driver took the bytes and nothing about what the chip did with them. Mode readback must be exact; duty readback must match the direct value or the documented RPM-target conversion with a stable valid scale; a mismatch, or a register that will not read at all, is counted as a failed write on that channel and register. In a sweep that aborts it before the next, lower command; in the control loop it reaches the same three-strike threshold, so one permanently ignored register fails safe while every other channel keeps answering |
 | Stall cap | Aborts if a fan sits at 0 RPM longer than 45 s |
 | `--probe` | Spinning a silent channel up is a register write like any other, so it happens inside the same cleanup scope as the sweep. Every channel the probe touched is handed back and read back, including one it decided has no fan on it; a probe that cannot be undone exits nonzero, saves nothing and recommends nothing |
 | Signals | `SIGTERM`, `SIGINT` (Ctrl-C), `SIGHUP` (SSH disconnect) and `SIGQUIT` all fail safe |
 | Lock | An interactive calibration and the service cannot run at once, whatever `--cache` each was given: the lock names the controller, not the file. `scripts/install.sh` and `scripts/uninstall.sh` hold the same global lock while they replace or delete a fan binary or unit, so neither can start in that window either |
 | Degenerate results | A sweep on a fan that never turned is discarded, not saved |
-| Exit path | Success, failure, exception and signal all force full duty plus automatic mode, then read the register back to confirm. A restore that cannot be confirmed exits nonzero and the calibration is not saved |
+| Exit path | Manual/unknown channels get a full-duty attempt before automatic handback; already-automatic channels remain automatic. Driver acknowledgement is checked, not physical effect. Failed cleanup exits nonzero and calibration is not saved |
 
 `SIGHUP` matters more than it sounds: calibrating over SSH and losing the
 connection is the most likely real-world interruption.
@@ -433,8 +452,9 @@ Expected before the first calibration. See [§6](#6-calibration-hazard).
 
 **`no controllable fan channel is spinning`**
 Passive detection found nothing turning. Either the fan is stopped or its
-tachometer is not reporting. Check `status`, then consider `--probe` or
-`--channels`.
+tachometer is not reporting. Check `status`; do not infer an EC controller or
+force a channel from that alone. See the
+[firmware findings](FAN_FIRMWARE_FINDINGS.md) before any write or probe.
 
 **`another qnap-tsx70-fancontrol instance holds ...`**
 The service is running. `sudo systemctl stop qnap-tsx70-fancontrol` first.
