@@ -1,9 +1,9 @@
 # Fan control (experimental, opt-in)
 
-> **Experimental, and not yet run on hardware.** The register behaviour this
-> depends on was observed on one machine, but **this implementation has never
-> been executed on a real TS-x70**. It writes directly to your chassis fan
-> controller and its calibration step **deliberately stops the fan**.
+> **Experimental; fan runtime accepted on one reference TS-470 Pro on
+> 2026-11-10.** Speed response, automatic handback and service stop/start were
+> exercised without stopping the fan. The new calibration procedure remains
+> unverified on hardware and **deliberately stops the fan**.
 >
 > You do not need it to use the LCD. If you only want the display, follow
 > [LCD_GUIDE.md](LCD_GUIDE.md) and stop reading here. The default installation
@@ -28,15 +28,15 @@ difference. The IT8528E suggestion in issue #1 is not an established diagnosis.
 
 ### Status by claim
 
-Two different things get confused here, so they are kept apart. What the
-*hardware* does was observed on a real machine. What *this program* does has
-only been exercised offline.
+Hardware observations, current runtime acceptance and offline fault-injection
+tests are separate. The 2026-11-10 fan-only acceptance is documented in the
+[firmware findings](FAN_FIRMWARE_FINDINGS.md#physical-acceptance-on-2026-11-10).
 
 | Claim | Status |
 |---|---|
 | `fanN_input`, `pwmN` and `pwmN_enable` semantics, and the 1 = manual / 2 = automatic mode numbering | Observed on the reference TS-470 Pro, under the previous implementation |
 | That the reference unit turns channel 3 and exposes three channels | Observed on the reference TS-470 Pro |
-| **This 2.0.0 implementation, on real TS-x70 hardware** | **Not yet exercised.** Validated offline only: unit tests plus simulated-controller runs of the safe-state, temperature-loss, dead-tachometer, stall-cap and signal paths |
+| **Current fan runtime on real hardware** | **Accepted on one TS-470 Pro, 2026-11-10:** channel 3 speed changes, automatic handback and service stop/start; loss-of-telemetry/stall/signal fault injection remains offline only |
 | Calibration measures usable stall and restart duties on a real fan | **Unverified for this implementation.** The v1 code that this replaces did produce usable values on one fan |
 | Works on any other TS-x70 model | **Unverified** |
 | Safe for unattended use | **Not claimed** |

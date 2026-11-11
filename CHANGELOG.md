@@ -5,9 +5,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-The current implementation has been validated offline with simulated devices
-and a fake filesystem. It has not yet been validated on physical TS-x70
-hardware. See [compatibility](docs/COMPATIBILITY.md).
+The fan runtime was installed and exercised on the reference TS-470 Pro on
+2026-11-10: speed response, automatic handback and service stop/start passed.
+The rewritten LCD, generic installer and hazardous calibration remain
+unverified on hardware. See [compatibility](docs/COMPATIBILITY.md).
 
 ### Added
 

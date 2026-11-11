@@ -1,7 +1,9 @@
 # TS-470 fan controller: official-firmware findings
 
-Status: **offline investigation complete; current-package hardware acceptance pending**.
-This resolves the controller-identification question in [issue #1](https://github.com/marzliak/qnap-ts470-linux/issues/1), not the claim that the current package has been tested on a physical fan.
+Status: **offline investigation and bounded fan-runtime acceptance complete**.
+[Issue #1](https://github.com/marzliak/qnap-ts470-linux/issues/1) has exact-model
+controller evidence and the physical response/recovery results below. This
+does not certify hazardous calibration, the rewritten LCD or unattended safety.
 
 ## Result
 
@@ -97,11 +99,34 @@ The relevant behavior was also inspected in Linux v6.8.
   they are not redistributed in this source repository. Local hashes identify
   the received bytes, not independent publisher-signature authentication.
 
-## Remaining physical acceptance
+## Physical acceptance on 2026-11-10
 
-Start with the existing read-only `status --json` and installed service/driver
-identity. Explain channel 2 versus 3 before selecting a physical test target.
-A later owner-approved bounded test must establish the actual fan's response
-and recovery with thermal monitoring; do not begin with the stall calibration.
-Until that test, keep fan control experimental and do not describe this source
-revision as installed, physically verified or safe unattended.
+The owner authorized deployment on the reference TS-470 Pro, Ubuntu 24.04.5
+LTS / kernel 7.0.0-42-generic. The fan binary from PR #6 was installed
+byte-for-byte (SHA-256
+`1f3908ba484a9786a06ba6aff130141a6e8a0fabdc3ecd9a98ac0aa2fe40069f`).
+Only fan control was replaced; the existing LCD process and files were preserved.
+
+- Passive discovery found channel 3 spinning, channels 1/2 at zero and automatic.
+  Bounded writes proved that **channel 3 controls the connected fan on this
+  modified unit**. Why it differs from QTS profile channel 2 remains historical
+  uncertainty, not an excuse to overwrite discovery.
+- Commands 255 → 128 → 255 produced settled tachometer medians of
+  **2564 → 1694 → 2564 RPM**. No stop command or stall calibration was used.
+  CPU temperature stayed 30–32 °C during this test.
+- Stopping the new service handed all channels back to automatic successfully;
+  channel 3 remained spinning at 1116–1691 RPM during the eight-second
+  observation. This is bounded actual recovery evidence, not merely a cached
+  mode readback or proof of every future automatic thermal decision.
+- The new service restarted successfully, stayed active with one writer and
+  zero unexpected restarts, and produced 969–1144 RPM across four ten-second
+  samples at 31–33 °C. The legacy service was disabled.
+- Existing measured calibration was migrated, conservatively clamping legacy
+  minimum/restart duties to 64. These are not newly measured stall thresholds.
+- Boot enablement and runtime-directory tmpfiles provisioning were configured;
+  **no reboot was performed**. The generic installer was not used for this
+  fan-only deployment and is not covered by the acceptance.
+
+Current fan runtime response/recovery is therefore accepted on this one unit.
+Keep other models, hazardous calibration, rewritten LCD and unattended/disk
+thermal protection outside this conclusion. The CPU-only curve is unchanged.
